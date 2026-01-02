@@ -3,72 +3,50 @@ import aiohttp
 from aiogram import Router, F, types
 from aiogram.filters import CommandStart
 
-# 1. Ініціалізація роутера
 router = Router()
 
-# 2. Налаштування Gemini
-# Використовуємо v1beta, оскільки вона стабільніше працює з flash-моделями
+# Отримуємо ключ
 API_KEY = os.getenv("API_KEY")
-MODEL_ID = "gemini-1.5-flash"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_ID}:generateContent?key={API_KEY}"
 
-# 3. Стартова команда
+# ФІКС 404: Пряме посилання без зайвих змінних у самому URL
+# Використовуємо v1beta/models/gemini-1.5-flash:generateContent
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={API_KEY}"
+
 @router.message(CommandStart())
 async def cmd_start(message: types.Message):
     kb = [
         [types.KeyboardButton(text="✨ Порада дня")],
         [types.KeyboardButton(text="🎂 Дні народження"), types.KeyboardButton(text="🛠 Діагностика ШІ")]
     ]
-    keyboard = types.ReplyKeyboardMarkup(
-        keyboard=kb, 
-        resize_keyboard=True,
-        input_field_placeholder="Оберіть дію..."
-    )
-    
+    keyboard = types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
     await message.answer(
-        "👋 <b>Привіт! Я твій Астро-помічник.</b>\n\n"
-        "Я можу зберігати дні народження та давати поради за допомогою ШІ.",
-        reply_markup=keyboard,
+        "👋 <b>Бот онлайн!</b>\nВикористовуйте кнопки нижче:", 
+        reply_markup=keyboard, 
         parse_mode="HTML"
     )
 
-# 4. Діагностика ШІ (з виправленням 404/403)
 @router.message(F.text == "🛠 Діагностика ШІ")
 async def check_ai_status(message: types.Message):
-    wait_msg = await message.answer("🔍 <b>Перевірка зв'язку з Gemini API...</b>", parse_mode="HTML")
+    wait_msg = await message.answer("🔍 Запит до Google Gemini v1beta...")
     
     headers = {'Content-Type': 'application/json'}
-    payload = {
-        "contents": [{
-            "parts": [{"text": "Write 'Success'"}]
-        }]
-    }
+    payload = {"contents": [{"parts": [{"text": "Say OK"}]}]}
     
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.post(GEMINI_URL, json=payload, headers=headers, timeout=15) as resp:
-                data = await resp.json()
-                
+            async with session.post(GEMINI_URL, json=payload, headers=headers) as resp:
                 if resp.status == 200:
-                    await wait_msg.edit_text(
-                        "✅ <b>Gemini API: 200 OK</b>\nМодель знайдена та працює успішно!",
-                        parse_mode="HTML"
-                    )
+                    await wait_msg.edit_text("✅ <b>200 OK</b>: ШІ працює!")
                 elif resp.status == 404:
                     await wait_msg.edit_text(
-                        "❌ <b>Помилка 404</b>\nGoogle не бачить модель. Перевірте, чи правильно вказано API_KEY у налаштуваннях Render.",
-                        parse_mode="HTML"
+                        "❌ <b>Помилка 404</b>\nМодель не знайдена. Перевірте, чи не видалили ви випадково символи з API_KEY в Render."
                     )
                 elif resp.status == 403:
-                    error_detail = data.get("error", {}).get("message", "")
                     await wait_msg.edit_text(
-                        f"❌ <b>Помилка 403 (Forbidden)</b>\n\nДеталі: {error_detail}\n\n"
-                        "<b>Рішення:</b> Перевірте, щоб регіон на Render був <b>Frankfurt</b>.",
-                        parse_mode="HTML"
+                        "❌ <b>Помилка 403</b>\nДоступ обмежено. Перевірте, що регіон сервісу — <b>Frankfurt</b>."
                     )
                 else:
-                    msg = data.get("error", {}).get("message", "Невідома помилка")
-                    await wait_msg.edit_text(f"❓ <b>Статус {resp.status}:</b>\n{msg}")
-                    
+                    data = await resp.text()
+                    await wait_msg.edit_text(f"❓ <b>Помилка {resp.status}</b>\n{data[:100]}")
         except Exception as e:
-            await wait_msg.edit_text(f"⚠️ <b>Помилка мережі:</b>\n<code>{str(e)[:100]}</code>", parse_mode="HTML")
+            await wait_msg.edit_text(f"⚠️ Помилка: {str(e)[:50]}")
