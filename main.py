@@ -8,7 +8,7 @@ from aiohttp import web
 from google import genai
 
 # ==========================================
-# ⚙️ КОНФІГУРАЦІЯ
+# ⚙️ НАЛАШТУВАННЯ ТА ЛОГУВАННЯ
 # ==========================================
 logging.basicConfig(
     level=logging.INFO, 
@@ -19,19 +19,18 @@ TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_KEY = os.getenv("API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Ініціалізація клієнтів
+# Ініціалізація
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 client = genai.Client(api_key=GEMINI_KEY)
 
 # ==========================================
-# 🗄️ БАЗА ДАНИХ NEON
+# 🗄️ РОБОТА З БАЗОЮ ДАНИХ NEON
 # ==========================================
 def init_db():
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
-        # Створення таблиці користувачів, якщо її немає
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
@@ -42,32 +41,32 @@ def init_db():
         conn.commit()
         cur.close()
         conn.close()
-        logging.info("✅ База даних Neon підключена успішно")
+        logging.info("✅ База даних Neon підключена")
     except Exception as e:
         logging.error(f"❌ Помилка БД: {e}")
 
 # ==========================================
-# 🌐 ВЕБ-СЕРВЕР (Для запобігання сплячці Render)
+# 🌐 ВЕБ-СЕРВЕР (Для Uptime Monitor)
 # ==========================================
 async def handle_ping(request):
-    return web.Response(text="WorkDays Bot is running!")
+    return web.Response(text="WorkDays Bot Status: OK")
 
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Render використовує порт 10000 для HTTP-трафіку
+    # Render автоматично шукає порт 10000
     site = web.TCPSite(runner, '0.0.0.0', 10000)
     await site.start()
-    logging.info("✅ Веб-сервер запущено на порту 10000")
+    logging.info("✅ Веб-сервер активний на порту 10000")
 
 # ==========================================
-# 🧠 ЛОГІКА ШІ (Gemini 1.5 Flash)
+# 🧠 ВЗАЄМОДІЯ З GEMINI ШІ
 # ==========================================
 async def ask_gemini(prompt: str):
     try:
-        # Використовуємо 1.5-flash через проблеми з квотами у версії 2.0
+        # ВАЖЛИВО: для нової бібліотеки використовуємо просто 'gemini-1.5-flash'
         response = client.models.generate_content(
             model='gemini-1.5-flash', 
             contents=prompt
@@ -78,17 +77,14 @@ async def ask_gemini(prompt: str):
     except Exception as e:
         logging.error(f"AI Error: {e}")
         if "429" in str(e):
-            return "⏳ Ліміт запитів вичерпано. Почекайте хвилину."
-        if "403" in str(e):
-            return "❌ Помилка доступу. Можливо, ваш API-ключ заблоковано або невірний регіон."
-        return f"⚠️ ШІ тимчасово недоступний."
+            return "⏳ Ліміт запитів вичерпано. Спробуйте через хвилину."
+        return "⚠️ ШІ тимчасово не відповідає."
 
 # ==========================================
-# 🤖 ОБРОБНИКИ ПОВІДОМЛЕНЬ
+# 🤖 ОБРОБКА ПОВІДОМЛЕНЬ ТЕЛЕГРАМ
 # ==========================================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    # Логіка збереження користувача в БД Neon
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
@@ -99,45 +95,46 @@ async def cmd_start(message: types.Message):
         conn.commit()
         cur.close()
         conn.close()
-    except Exception as e:
-        logging.error(f"DB Insert Error: {e}")
+    except:
+        pass
 
     await message.answer(
         f"🚀 <b>Привіт, {message.from_user.first_name}!</b>\n\n"
-        "Я бот, підключений до бази Neon та ШІ Gemini. Запитуй що завгодно!",
+        "Я твій ШІ-помічник. Запитуй що завгодно!",
         parse_mode="HTML"
     )
 
 @dp.message(F.text)
 async def handle_text(message: types.Message):
-    # Показуємо статус "друкує"
+    # Ефект "друкує..."
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
     ai_response = await ask_gemini(message.text)
     await message.answer(ai_response)
 
 # ==========================================
-# 🚀 ГОЛОВНИЙ ЗАПУСК
+# 🚀 ЗАПУСК ТА ЗАВЕРШЕННЯ
 # ==========================================
 async def main():
-    # 1. Ініціалізація бази даних
+    # 1. Підготовка БД
     init_db()
     
-    # 2. Запуск веб-сервера для Render
+    # 2. Запуск веб-сервера (щоб Render не "спав")
     await start_web_server()
     
-    # 3. Видалення вебхука для Polling
+    # 3. Видалення вебхука (критично для Polling)
     await bot.delete_webhook(drop_pending_updates=True)
     
-    logging.info("🚀 Бот запускається у режимі Polling...")
+    logging.info("🚀 Бот запущений!")
     
     try:
         await dp.start_polling(bot)
     finally:
+        # Коректне закриття з'єднань
         await bot.session.close()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logging.info("Бот зупинений.")
+        logging.info("Бот вимкнений.")
