@@ -5,24 +5,41 @@ import psycopg2
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiohttp import web
-import google.generativeai as genai  # Зміна бібліотеки
+import google.generativeai as genai
 
-# Конфігурація
+# Налаштування логів
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_KEY = os.getenv("API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Налаштування Gemini
+# Конфігурація ШІ
 genai.configure(api_key=GEMINI_KEY)
-# Використовуємо 1.5 Flash як основну
-model = genai.GenerativeModel('gemini-1.5-flash')
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# База даних
+# Функція вибору живої моделі
+async def ask_gemini(prompt: str):
+    # Пробуємо спочатку 1.5 Flash (найстабільніша)
+    # Якщо хочете 2.0, замініть назву на 'gemini-2.0-flash-exp'
+    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro']
+    
+    for model_name in models_to_try:
+        try:
+            logging.info(f"🤖 Спроба моделі: {model_name}")
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            if response and response.text:
+                return response.text
+        except Exception as e:
+            logging.error(f"⚠️ Помилка {model_name}: {str(e)[:50]}")
+            continue
+            
+    return "⏳ ШІ перевантажений запитами. Спробуйте пізніше."
+
+# База даних Neon
 def init_db():
     try:
         conn = psycopg2.connect(DATABASE_URL)
@@ -31,36 +48,21 @@ def init_db():
         conn.commit()
         cur.close()
         conn.close()
-        logging.info("✅ БД Neon готова")
+        logging.info("✅ База даних підключена")
     except Exception as e:
         logging.error(f"❌ Помилка БД: {e}")
 
-# Функція запиту до ШІ
-async def ask_gemini(prompt: str):
-    try:
-        # Старий надійний метод
-        response = model.generate_content(prompt)
-        if response and response.text:
-            return response.text
-        return "🤖 ШІ не зміг відповісти."
-    except Exception as e:
-        logging.error(f"AI Error: {e}")
-        if "429" in str(e):
-            return "⏳ Ліміт вичерпано. Спробуйте через хвилину."
-        return f"⚠️ Помилка ШІ: {str(e)[:50]}"
-
-# Хендлери
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("🚀 Бот запущений на стабільній версії!")
+    await message.answer("🚀 Бот активний! Я використовую стабільну версію Gemini 1.5.")
 
 @dp.message(F.text)
 async def handle_text(message: types.Message):
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    ai_response = await ask_gemini(message.text)
-    await message.answer(ai_response)
+    response = await ask_gemini(message.text)
+    await message.answer(response)
 
-# Веб-сервер
+# Веб-сервер для Render
 async def handle_ping(request):
     return web.Response(text="OK")
 
@@ -73,6 +75,7 @@ async def main():
     await web.TCPSite(runner, '0.0.0.0', 10000).start()
     
     await bot.delete_webhook(drop_pending_updates=True)
+    logging.info("🚀 Полінг запущено!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
