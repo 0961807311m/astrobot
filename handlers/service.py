@@ -8,8 +8,8 @@ router = Router()
 # Отримуємо ключ
 API_KEY = os.getenv("API_KEY", "").strip()
 
-# ФІКС 404: Використовуємо актуальну повну назву моделі для v1beta
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={API_KEY}"
+# ФІКС 404: Переходимо на стабільну версію v1 та використовуємо перевірену назву моделі
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={API_KEY}"
 
 @router.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -19,7 +19,7 @@ async def cmd_start(message: types.Message):
     ]
     keyboard = types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
     await message.answer(
-        "👋 <b>Астро-бот онлайн!</b>\n\nЯ готовий працювати через Google Gemini 1.5.", 
+        "👋 <b>Астро-бот готовий!</b>\nВикористовуйте меню для навігації:", 
         reply_markup=keyboard, 
         parse_mode="HTML"
     )
@@ -27,10 +27,10 @@ async def cmd_start(message: types.Message):
 @router.message(F.text == "🛠 Діагностика ШІ")
 async def check_ai_status(message: types.Message):
     if not API_KEY:
-        await message.answer("❌ Помилка: API_KEY не налаштовано в Render.")
+        await message.answer("❌ Помилка: API_KEY порожній у налаштуваннях Render.")
         return
 
-    wait_msg = await message.answer("🔍 Перевірка <b>gemini-1.5-flash</b>...")
+    wait_msg = await message.answer("🔍 Запит до <b>Gemini 1.5 Flash (v1)</b>...")
     
     headers = {'Content-Type': 'application/json'}
     payload = {"contents": [{"parts": [{"text": "Say 'OK'"}]}]}
@@ -38,12 +38,14 @@ async def check_ai_status(message: types.Message):
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(GEMINI_URL, json=payload, headers=headers) as resp:
+                data = await resp.json()
+                
                 if resp.status == 200:
-                    await wait_msg.edit_text("✅ <b>200 OK</b>: Зв'язок встановлено! Модель 1.5-flash відповідає.")
+                    await wait_msg.edit_text("✅ <b>200 OK</b>: Модель знайдена і відповідає!")
                 else:
-                    # Якщо знову 404, ми отримаємо деталі з JSON
-                    data = await resp.json()
+                    # Отримуємо детальне повідомлення про помилку
                     err_message = data.get("error", {}).get("message", "Unknown error")
                     await wait_msg.edit_text(f"❌ <b>Помилка {resp.status}</b>\n{err_message}")
+                    
         except Exception as e:
             await wait_msg.edit_text(f"⚠️ Помилка з'єднання: {str(e)[:50]}")
