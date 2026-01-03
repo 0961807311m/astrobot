@@ -5,47 +5,45 @@ from aiogram.filters import CommandStart
 
 router = Router()
 
-# Отримуємо ключ
 API_KEY = os.getenv("API_KEY", "").strip()
-
-# ФІКС 404: Переходимо на стабільну версію v1 та використовуємо перевірену назву моделі
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={API_KEY}"
 
 @router.message(CommandStart())
 async def cmd_start(message: types.Message):
     kb = [
         [types.KeyboardButton(text="✨ Порада дня")],
-        [types.KeyboardButton(text="🎂 Дні народження"), types.KeyboardButton(text="🛠 Діагностика ШІ")]
+        [types.KeyboardButton(text="🎂 Дні народження"), types.KeyboardButton(text="🛠 Список моделей ШІ")]
     ]
     keyboard = types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
-    await message.answer(
-        "👋 <b>Астро-бот готовий!</b>\nВикористовуйте меню для навігації:", 
-        reply_markup=keyboard, 
-        parse_mode="HTML"
-    )
+    await message.answer("✅ Бот онлайн. Натисніть <b>'Список моделей ШІ'</b>, щоб побачити доступні назви.", reply_markup=keyboard, parse_mode="HTML")
 
-@router.message(F.text == "🛠 Діагностика ШІ")
-async def check_ai_status(message: types.Message):
+@router.message(F.text == "🛠 Список моделей ШІ")
+async def list_models(message: types.Message):
     if not API_KEY:
-        await message.answer("❌ Помилка: API_KEY порожній у налаштуваннях Render.")
+        await message.answer("❌ API_KEY не налаштовано.")
         return
 
-    wait_msg = await message.answer("🔍 Запит до <b>Gemini 1.5 Flash (v1)</b>...")
+    wait_msg = await message.answer("🔍 Запитую список доступних моделей у Google...")
     
-    headers = {'Content-Type': 'application/json'}
-    payload = {"contents": [{"parts": [{"text": "Say 'OK'"}]}]}
+    # Використовуємо спеціальний ендпоінт для переліку моделей
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
     
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.post(GEMINI_URL, json=payload, headers=headers) as resp:
+            async with session.get(url) as resp:
                 data = await resp.json()
-                
                 if resp.status == 200:
-                    await wait_msg.edit_text("✅ <b>200 OK</b>: Модель знайдена і відповідає!")
-                else:
-                    # Отримуємо детальне повідомлення про помилку
-                    err_message = data.get("error", {}).get("message", "Unknown error")
-                    await wait_msg.edit_text(f"❌ <b>Помилка {resp.status}</b>\n{err_message}")
+                    models = data.get("models", [])
+                    # Фільтруємо тільки ті, що підтримують генерацію контенту
+                    names = [m["name"].replace("models/", "") for m in models if "generateContent" in m.get("supportedGenerationMethods", [])]
                     
+                    if names:
+                        response_text = "✅ <b>Доступні моделі:</b>\n\n" + "\n".join([f"• <code>{name}</code>" for name in names])
+                        response_text += "\n\nСкопіюйте назву, яка вам подобається (напр. gemini-1.5-flash-latest)."
+                        await wait_msg.edit_text(response_text, parse_mode="HTML")
+                    else:
+                        await wait_msg.edit_text("😕 Моделей не знайдено, але ключ спрацював.")
+                else:
+                    err = data.get("error", {}).get("message", "Unknown error")
+                    await wait_msg.edit_text(f"❌ Помилка {resp.status}: {err}")
         except Exception as e:
-            await wait_msg.edit_text(f"⚠️ Помилка з'єднання: {str(e)[:50]}")
+            await wait_msg.edit_text(f"⚠️ Помилка: {str(e)}")
