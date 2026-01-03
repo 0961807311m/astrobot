@@ -1,47 +1,77 @@
 import os
 import asyncio
-from aiogram import Bot, Dispatcher
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiohttp import web
-import database as db
-from handlers import service, birthdays, ai_advice, shift
+import logging
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from google import genai
+from google.genai import types as genai_types
 
-TOKEN = os.getenv("BOT_TOKEN")
+# ==========================================
+# ⚙️ КОНФІГУРАЦІЯ
+# ==========================================
+# Отримуємо токени зі змінних середовища Render
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_KEY = os.getenv("API_KEY")
 
-async def handle(request):
-    return web.Response(text="Bot is alive!")
+# Ініціалізація клієнтів
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+client = genai.Client(api_key=GEMINI_KEY)
 
-async def run_web_server():
-    app = web.Application()
-    app.router.add_get("/", handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    print(f"✅ Веб-сервер запущено на порту {port}")
+# Налаштування логування
+logging.basicConfig(level=logging.INFO)
 
-async def main():
+# ==========================================
+# 🧠 ЛОГІКА ШІ (Gemini 2.0 Flash)
+# ==========================================
+async def ask_gemini(prompt: str):
     try:
-        db.init_db()
-        print("✅ База даних Neon підключена успішно")
+        # Використовуємо модель 2.0 Flash, як у твоєму прикладі
+        response = client.models.generate_content(
+            model='gemini-2.0-flash', 
+            contents=prompt
+        )
+        return response.text.strip()
     except Exception as e:
-        print(f"❌ Помилка бази даних: {e}")
+        logging.error(f"Помилка ШІ: {e}")
+        # Якщо 429 (ліміти) або 404, бот скаже про це
+        if "429" in str(e):
+            return "⚠️ Помилка: Перевищено ліміт запитів Google. Спробуйте через хвилину."
+        return f"❌ Помилка ШІ: {str(e)[:100]}"
 
-    await run_web_server()
+# ==========================================
+# 🤖 ОБРОБНИКИ ТЕЛЕГРАМ
+# ==========================================
 
-    bot = Bot(token=TOKEN, session=AiohttpSession())
-    dp = Dispatcher()
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "🚀 <b>Бот активований!</b>\n"
+        "Я працюю на базі Gemini 2.0 Flash. Напиши мені щось!",
+        parse_mode="HTML"
+    )
 
-    # Порядок реєстрації: service завжди перший!
-    dp.include_router(service.router)
-    dp.include_router(birthdays.router)
-    dp.include_router(ai_advice.router)
-    dp.include_router(shift.router)
+@dp.message(F.text)
+async def handle_text(message: types.Message):
+    # Показуємо статус "друкує", щоб користувач знав, що ШІ думає
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    
+    user_text = message.text
+    ai_response = await ask_gemini(user_text)
+    
+    await message.answer(ai_response)
 
-    print("🚀 Бот запускається у режимі Polling...")
+# ==========================================
+# 🚀 ЗАПУСК
+# ==========================================
+async def main():
+    logging.info("🚀 Бот запускається у режимі Polling...")
+    # Видаляємо вебхуки, якщо вони були раніше (це фіксить Conflict)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Бот зупинений.")
