@@ -2,3 +2,5 @@ aiogram
 aiohttp
 psycopg2-binary
 pandas
+aiogram==3.13.1
+google-genai==0.3.0
