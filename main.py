@@ -19,13 +19,14 @@ TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_KEY = os.getenv("API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Ініціалізація
+# Ініціалізація клієнтів
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
+# Для бібліотеки google-genai 0.3.0+
 client = genai.Client(api_key=GEMINI_KEY)
 
 # ==========================================
-# 🗄️ РОБОТА З БАЗОЮ ДАНИХ NEON
+# 🗄️ БАЗА ДАНИХ NEON
 # ==========================================
 def init_db():
     try:
@@ -41,12 +42,12 @@ def init_db():
         conn.commit()
         cur.close()
         conn.close()
-        logging.info("✅ База даних Neon підключена")
+        logging.info("✅ База даних Neon підключена успішно")
     except Exception as e:
         logging.error(f"❌ Помилка БД: {e}")
 
 # ==========================================
-# 🌐 ВЕБ-СЕРВЕР (Для Uptime Monitor)
+# 🌐 ВЕБ-СЕРВЕР (Для запобігання сплячці Render)
 # ==========================================
 async def handle_ping(request):
     return web.Response(text="WorkDays Bot Status: OK")
@@ -56,17 +57,18 @@ async def start_web_server():
     app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Render автоматично шукає порт 10000
+    # Render автоматично перенаправляє трафік на порт 10000
     site = web.TCPSite(runner, '0.0.0.0', 10000)
     await site.start()
-    logging.info("✅ Веб-сервер активний на порту 10000")
+    logging.info("✅ Веб-сервер запущено на порту 10000")
 
 # ==========================================
 # 🧠 ВЗАЄМОДІЯ З GEMINI ШІ
 # ==========================================
 async def ask_gemini(prompt: str):
     try:
-        # ВАЖЛИВО: для нової бібліотеки використовуємо просто 'gemini-1.5-flash'
+        # ВИПРАВЛЕННЯ 404: Для google-genai використовуємо ТІЛЬКИ коротку назву
+        # Без 'models/' на початку!
         response = client.models.generate_content(
             model='gemini-1.5-flash', 
             contents=prompt
@@ -76,15 +78,19 @@ async def ask_gemini(prompt: str):
         return "🤖 ШІ не зміг сформувати відповідь."
     except Exception as e:
         logging.error(f"AI Error: {e}")
-        if "429" in str(e):
-            return "⏳ Ліміт запитів вичерпано. Спробуйте через хвилину."
+        error_str = str(e)
+        if "404" in error_str:
+            return "❌ Помилка: Модель не знайдено. Зверніться до адміністратора."
+        if "429" in error_str:
+            return "⏳ Ліміт запитів вичерпано. Почекайте хвилину."
         return "⚠️ ШІ тимчасово не відповідає."
 
 # ==========================================
-# 🤖 ОБРОБКА ПОВІДОМЛЕНЬ ТЕЛЕГРАМ
+# 🤖 ОБРОБНИКИ ТЕЛЕГРАМ
 # ==========================================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    # Зберігаємо користувача в БД
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
@@ -95,42 +101,42 @@ async def cmd_start(message: types.Message):
         conn.commit()
         cur.close()
         conn.close()
-    except:
-        pass
+    except Exception as e:
+        logging.error(f"DB Error: {e}")
 
     await message.answer(
         f"🚀 <b>Привіт, {message.from_user.first_name}!</b>\n\n"
-        "Я твій ШІ-помічник. Запитуй що завгодно!",
+        "Бот працює стабільно. Запитуй мене про що завгодно!",
         parse_mode="HTML"
     )
 
 @dp.message(F.text)
 async def handle_text(message: types.Message):
-    # Ефект "друкує..."
+    # Показуємо статус "typing..." в чаті
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
     ai_response = await ask_gemini(message.text)
     await message.answer(ai_response)
 
 # ==========================================
-# 🚀 ЗАПУСК ТА ЗАВЕРШЕННЯ
+# 🚀 ЗАПУСК
 # ==========================================
 async def main():
-    # 1. Підготовка БД
+    # 1. Ініціалізація БД
     init_db()
     
-    # 2. Запуск веб-сервера (щоб Render не "спав")
+    # 2. Запуск веб-сервера (для UptimeRobot/Render)
     await start_web_server()
     
-    # 3. Видалення вебхука (критично для Polling)
+    # 3. Видалення вебхука (щоб уникнути ConflictError)
     await bot.delete_webhook(drop_pending_updates=True)
     
-    logging.info("🚀 Бот запущений!")
+    logging.info("🚀 Бот запущений у режимі Polling!")
     
     try:
         await dp.start_polling(bot)
     finally:
-        # Коректне закриття з'єднань
+        # Закриваємо сесію при вимкненні
         await bot.session.close()
 
 if __name__ == "__main__":
