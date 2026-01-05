@@ -22,7 +22,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Клієнт ШІ (без повторів для швидкого fallback)
+# Клієнт ШІ (без внутрішніх повторів для швидкого перемикання нами власноруч)
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=API_KEY,
@@ -48,33 +48,36 @@ def init_db():
     except Exception as e:
         logging.error(f"❌ Помилка БД: {e}")
 
-# --- Робота з ШІ ---
+# --- Робота з ШІ (Покращений Fallback) ---
 async def ask_ai(system_prompt, user_prompt):
+    # Найбільш актуальний список моделей на 2026 рік
     models = [
-        "google/gemini-2.0-flash-exp:free",
-        "meta-llama/llama-3.1-8b-instruct:free",
-        "qwen/qwen-2.5-72b-instruct:free",
-        "mistralai/mistral-7b-instruct:free",
-        "gryphe/mythomax-l2-13b:free"
+        "google/gemini-2.0-flash-exp:free",      # Найкраща швидкість/якість
+        "meta-llama/llama-3.1-8b-instruct:free", # Найнадійніша
+        "qwen/qwen-2.5-72b-instruct:free",       # Дуже розумна
+        "google/learnlm-1.5-pro-experimental:free", # Нова експериментальна
+        "mistralai/mistral-7b-instruct:free"     # Останній шанс
     ]
     for model in models:
         try:
+            logging.info(f"🤖 Запит до: {model}")
             response = client.chat.completions.create(
                 model=model,
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-                extra_headers={"HTTP-Referer": "https://render.com", "X-Title": "AstroBot_v5"},
-                timeout=10.0 
+                extra_headers={"HTTP-Referer": "https://render.com", "X-Title": "AstroBot_vFinal"},
+                timeout=15.0 
             )
             return response.choices[0].message.content
         except Exception as e:
-            logging.warning(f"⚠️ {model} зайнята. Спроба наступної...")
-            await asyncio.sleep(0.5)
+            logging.warning(f"⚠️ {model} недоступна ({str(e)[:40]}). Пробую наступну...")
+            await asyncio.sleep(0.8) # Пауза, щоб не "заспамити" OpenRouter
             continue 
-    return "⚠️ ШІ-лінії перевантажені. Спробуйте через 30 секунд."
+    return "⚠️ Вибачте, всі безкоштовні лінії ШІ зараз перевантажені. Спробуйте через хвилину."
 
-# --- Автоматичне привітання ---
+# --- Автоматичне привітання о 09:00 ---
 async def daily_birthday_check():
     today = datetime.now().strftime("%m-%d")
+    logging.info(f"⏰ Запуск щоденної перевірки: {today}")
     try:
         conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
         cur.execute("SELECT full_name FROM employees WHERE to_char(birth_date, 'MM-DD') = %s", (today,))
@@ -112,7 +115,7 @@ async def cmd_start(message: types.Message):
     conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
     cur.execute("INSERT INTO users (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING", (message.from_user.id, message.from_user.username))
     conn.commit(); cur.close(); conn.close()
-    await message.answer("🚀 Бот запущений! Оберіть розділ:", reply_markup=main_menu())
+    await message.answer("🚀 Вітаю! Я твій ШІ-помічник. Оберіть розділ меню:", reply_markup=main_menu())
 
 @dp.message(F.text == "✨ Порада дня")
 async def astro_handler(message: types.Message, state: FSMContext):
@@ -120,7 +123,7 @@ async def astro_handler(message: types.Message, state: FSMContext):
     cur.execute("SELECT birthday FROM users WHERE user_id = %s", (message.from_user.id,))
     res = cur.fetchone(); cur.close(); conn.close()
     if not res or not res[0]:
-        await message.answer("Введіть вашу дату народження (ДД.ММ.РРРР):")
+        await message.answer("Введіть вашу дату народження (наприклад: **15.05.1990**):")
         await state.set_state(BotStates.waiting_for_user_birthday)
     else:
         await bot.send_chat_action(message.chat.id, "typing")
@@ -134,9 +137,9 @@ async def set_user_bday(message: types.Message, state: FSMContext):
         conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
         cur.execute("UPDATE users SET birthday = %s WHERE user_id = %s", (bday, message.from_user.id))
         conn.commit(); cur.close(); conn.close()
-        await message.answer("✅ Дата збережена! Натисніть кнопку 'Порада дня' ще раз.", reply_markup=main_menu())
+        await message.answer("✅ Дату збережено! Натисніть '✨ Порада дня'.", reply_markup=main_menu())
         await state.clear()
-    except: await message.answer("❌ Формат: ДД.ММ.РРРР")
+    except: await message.answer("❌ Формат невірний. Напишіть як: ДД.ММ.РРРР")
 
 @dp.message(F.text == "🎂 Дні народження")
 async def bdays_menu(message: types.Message):
@@ -144,12 +147,12 @@ async def bdays_menu(message: types.Message):
     conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
     cur.execute("SELECT full_name FROM employees WHERE to_char(birth_date, 'MM-DD') = %s", (today,))
     workers = cur.fetchall(); cur.close(); conn.close()
-    text = "Сьогодні іменинників немає. ✨" if not workers else "🎉 Сьогодні святкують:\n" + "\n".join([f"🎂 {w[0]}" for w in workers])
+    text = "Сьогодні іменинників немає серед працівників. ✨" if not workers else "🎉 Сьогодні святкують:\n" + "\n".join([f"🎂 {w[0]}" for w in workers])
     await message.answer(text, reply_markup=employees_inline())
 
 @dp.callback_query(F.data == "add_employee")
 async def start_add_employee(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Надішліть дані працівника одним повідомленням у форматі:\n\n**Прізвище Ім'я - ДД.ММ.РРРР**\n\nПриклад: Олександр Коваленко - 15.05.1990")
+    await callback.message.answer("Надішліть дані працівника у форматі:\n\n**Ім'я Прізвище - ДД.ММ.РРРР**")
     await state.set_state(BotStates.waiting_for_employee_data)
     await callback.answer()
 
@@ -162,13 +165,13 @@ async def save_employee(message: types.Message, state: FSMContext):
         conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
         cur.execute("INSERT INTO employees (full_name, birth_date) VALUES (%s, %s)", (name, bday))
         conn.commit(); cur.close(); conn.close()
-        await message.answer(f"✅ Працівника {name} успішно додано!", reply_markup=main_menu())
+        await message.answer(f"✅ Колегу {name} додано до списку привітань!", reply_markup=main_menu())
         await state.clear()
-    except: await message.answer("❌ Помилка! Дотримуйтесь формату: Ім'я - ДД.ММ.РРРР")
+    except: await message.answer("❌ Помилка! Пишіть у форматі: Ім'я - ДД.ММ.РРРР")
 
 @dp.message(F.text == "💬 Поговорити")
 async def talk_info(message: types.Message):
-    await message.answer("Просто пиши будь-яке запитання, і я відповім!")
+    await message.answer("Я готовий до спілкування. Пиши будь-яке запитання!")
 
 @dp.message(F.text)
 async def chat_handler(message: types.Message):
@@ -176,7 +179,7 @@ async def chat_handler(message: types.Message):
     ans = await ask_ai("Ти корисний помічник.", message.text)
     await message.answer(ans)
 
-# --- Старт ---
+# --- Запуск ---
 async def main():
     init_db()
     scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
