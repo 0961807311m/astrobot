@@ -11,43 +11,37 @@ from aiogram.fsm.state import State, StatesGroup
 from aiohttp import web
 from openai import OpenAI
 
-# --- Налаштування ---
-logging.basicConfig(level=logging.INFO)
+# --- Конфігурація ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
 TOKEN = os.getenv("BOT_TOKEN")
-GROQ_KEY = os.getenv("GROQ_API_KEY")
+# Використовуємо OpenRouter для стабільного безкоштовного доступу
+API_KEY = os.getenv("OPENROUTER_API_KEY") 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
-client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=GROQ_KEY)
 
-# --- Стани ---
+# Клієнт для OpenRouter (сумісний з OpenAI)
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=API_KEY
+)
+
+# --- Стани (FSM) ---
 class UserProfile(StatesGroup):
     waiting_for_birthday = State()
 
-# --- Функція створення клавіатури ---
-def main_menu_kb():
-    builder = ReplyKeyboardBuilder()
-    # Додаємо кнопки
-    builder.button(text="💬 Поговорити")
-    builder.button(text="✨ Порада дня")
-    builder.button(text="🎂 Дні народження")
-    # Налаштовуємо вигляд (2 кнопки в ряд, потім 1)
-    builder.adjust(2, 1)
-    return builder.as_markup(resize_keyboard=True, input_field_placeholder="Оберіть розділ меню")
-
-# --- База даних ---
+# --- База даних (з виправленням помилки UndefinedColumn) ---
 def init_db():
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                birthday DATE
-            );
-        """)
+        # Створення таблиці користувачів
+        cur.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, username TEXT);")
+        # ПРИМУСОВЕ додавання колонки, якщо її не було
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS birthday DATE;")
+        # Таблиця працівників
         cur.execute("""
             CREATE TABLE IF NOT EXISTS employees (
                 id SERIAL PRIMARY KEY,
@@ -58,38 +52,52 @@ def init_db():
         conn.commit()
         cur.close()
         conn.close()
-        logging.info("✅ База даних готова")
+        logging.info("✅ База даних успішно ініціалізована та оновлена")
     except Exception as e:
         logging.error(f"❌ Помилка БД: {e}")
 
-# --- Функція ШІ ---
+# --- Меню ---
+def main_menu_kb():
+    builder = ReplyKeyboardBuilder()
+    builder.button(text="💬 Поговорити")
+    builder.button(text="✨ Порада дня")
+    builder.button(text="🎂 Дні народження")
+    builder.adjust(2, 1)
+    return builder.as_markup(resize_keyboard=True)
+
+# --- Логіка ШІ ---
 async def ask_ai(system_prompt, user_prompt):
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            # Безкоштовна актуальна модель Llama 3.1 від OpenRouter
+            model="meta-llama/llama-3.1-8b-instruct:free",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
-            ]
+            ],
+            extra_headers={
+                "HTTP-Referer": "https://render.com", # Обов'язково для OpenRouter
+                "X-Title": "My Astro Bot"
+            }
         )
         return response.choices[0].message.content
     except Exception as e:
-        return "⚠️ ШІ тимчасово недоступний."
+        logging.error(f"AI Error: {e}")
+        return "⚠️ ШІ зараз розмірковує надто довго. Спробуйте за хвилину!"
 
-# --- Хендлери ---
+# --- Обробники повідомлень ---
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     init_db()
-    # Надсилаємо повідомлення з клавіатурою
     await message.answer(
-        f"Привіт, {message.from_user.first_name}! 🚀\n\nЯ твій ШІ-помічник. Оберіть потрібний розділ нижче:",
+        f"Привіт, {message.from_user.first_name}! 🚀\nЯ твій персональний асистент. Оберіть дію:",
         reply_markup=main_menu_kb()
     )
 
 @dp.message(F.text == "💬 Поговорити")
 async def talk_mode(message: types.Message):
-    await message.answer("Я уважно слухаю. Напиши своє питання, і я відповім!")
+    await message.answer("Я весь в увазі! Про що хочеш поспілкуватися?")
 
 @dp.message(F.text == "✨ Порада дня")
 async def astro_advice(message: types.Message, state: FSMContext):
@@ -101,19 +109,24 @@ async def astro_advice(message: types.Message, state: FSMContext):
     conn.close()
 
     if not res or not res[0]:
-        await message.answer("Для точної поради мені потрібна твоя дата народження. Введи її у форматі **ДД.ММ.РРРР** (наприклад: 25.10.1995)")
+        await message.answer("Для точного розрахунку введіть дату народження у форматі: **ДД.ММ.РРРР**\n(Наприклад: 12.04.1992)")
         await state.set_state(UserProfile.waiting_for_birthday)
     else:
         await bot.send_chat_action(message.chat.id, "typing")
         bday = res[0].strftime("%d.%m.%Y")
-        system_msg = "Ти професійний коуч та психолог. Даєш поради на основі Матриці Долі, але не звучиш як ворожка. Твій тон — надихаючий та аналітичний."
-        user_msg = f"Моя дата народження {bday}. Дай пораду на сьогодні {datetime.now().strftime('%d.%m.%Y')}. Напиши: 1. Порада дня. 2. Чого очікувати. 3. Чого уникати. 4. Енергія дня у балах (0-100). Українською."
         
-        advice = await ask_ai(system_msg, user_msg)
-        await message.answer(advice)
+        system_prompt = "Ти професійний коуч та експерт з саморозвитку. Надаєш поради на основі Матриці Долі (астрологія та нумерологія), але без магічного жаргону. Твій стиль: аналітичний, надихаючий."
+        user_prompt = (
+            f"Дата народження користувача: {bday}. Сьогоднішня дата: {datetime.now().strftime('%d.%m.%Y')}. "
+            "Напиши коротку пораду дня. Обов'язково виділи пункти: "
+            "1. Чого очікувати. 2. Чого уникати. 3. Енергія дня у балах (від 0 до 100). Відповідай українською."
+        )
+        
+        advice = await ask_ai(system_prompt, user_prompt)
+        await message.answer(f"🔮 **Твій прогноз за Матрицею Долі:**\n\n{advice}")
 
 @dp.message(UserProfile.waiting_for_birthday)
-async def save_bday(message: types.Message, state: FSMContext):
+async def process_bday(message: types.Message, state: FSMContext):
     try:
         bday = datetime.strptime(message.text, "%d.%m.%Y").date()
         conn = psycopg2.connect(DATABASE_URL)
@@ -126,13 +139,14 @@ async def save_bday(message: types.Message, state: FSMContext):
         conn.commit()
         cur.close()
         conn.close()
-        await message.answer("✅ Дату збережено! Натисніть '✨ Порада дня' ще раз.", reply_markup=main_menu_kb())
+        
+        await message.answer("✅ Дату збережено! Тепер тисни '✨ Порада дня' знову.", reply_markup=main_menu_kb())
         await state.clear()
     except ValueError:
-        await message.answer("❌ Формат невірний. Напиши дату як ДД.ММ.РРРР (наприклад: 01.01.2000)")
+        await message.answer("❌ Невірний формат. Будь ласка, напиши дату як ДД.ММ.РРРР (наприклад: 01.01.2000)")
 
 @dp.message(F.text == "🎂 Дні народження")
-async def check_bdays(message: types.Message):
+async def check_birthdays(message: types.Message):
     today = datetime.now().strftime("%m-%d")
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
@@ -142,20 +156,23 @@ async def check_bdays(message: types.Message):
     conn.close()
 
     if workers:
-        res = "🎉 **Сьогодні святкують:**\n\n" + "\n".join([f"🎂 {w[0]}" for w in workers])
-        await message.answer(res)
+        text = "🎉 **Сьогодні іменинники серед колег:**\n\n" + "\n".join([f"🎂 {w[0]}" for w in workers])
+        await message.answer(text)
     else:
-        await message.answer("Сьогодні іменинників немає. ✨")
+        await message.answer("Сьогодні іменинників серед працівників немає. ✨")
 
-# --- Веб-сервер ---
+# --- Веб-сервер для Render ---
 async def handle_ping(request): return web.Response(text="OK")
 
 async def main():
     init_db()
-    app = web.Application(); app.router.add_get("/", handle_ping)
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app); await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', 10000).start()
+    
     await bot.delete_webhook(drop_pending_updates=True)
+    logging.info("🚀 Бот запущений!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
