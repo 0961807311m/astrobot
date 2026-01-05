@@ -2,3 +2,4 @@ aiogram==3.13.1
 openai
 psycopg2-binary
 aiohttp
+apscheduler
