@@ -9,19 +9,16 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiohttp import web
-from openai import OpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# --- Налаштування ---
+# --- Налаштування логування ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 TOKEN = os.getenv("BOT_TOKEN")
-API_KEY = os.getenv("OPENROUTER_API_KEY") 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
-client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=API_KEY, max_retries=0)
 scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
 
 class BotStates(StatesGroup):
@@ -30,26 +27,26 @@ class BotStates(StatesGroup):
     waiting_for_task_name = State()
     waiting_for_route_data = State()
 
-# --- База даних (З автоматичним додаванням колонок) ---
+# --- База даних ---
 def init_db():
     try:
         conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
         cur.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, username TEXT);")
-        cur.execute("CREATE TABLE IF NOT EXISTS employees (id SERIAL PRIMARY KEY, full_name TEXT, birth_date DATE);")
+        cur.execute("CREATE TABLE IF NOT EXISTS employees (id SERIAL PRIMARY KEY, full_name TEXT, birth_date DATE, role TEXT DEFAULT 'Працівник');")
         cur.execute("CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, title TEXT, is_done BOOLEAN DEFAULT FALSE);")
         cur.execute("CREATE TABLE IF NOT EXISTS routes (id SERIAL PRIMARY KEY, info TEXT);")
         
-        # Додаємо shift_type в users
-        cur.execute("""DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='shift_type') 
-                       THEN ALTER TABLE users ADD COLUMN shift_type TEXT DEFAULT 'day'; END IF; END $$;""")
-        
-        # Додаємо role в employees
-        cur.execute("""DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='employees' AND column_name='role') 
-                       THEN ALTER TABLE employees ADD COLUMN role TEXT DEFAULT 'Працівник'; END IF; END $$;""")
-        
+        # Перевірка колонок
+        cur.execute("""DO $$ BEGIN 
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='shift_type') THEN
+                ALTER TABLE users ADD COLUMN shift_type TEXT DEFAULT 'day';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='employees' AND column_name='role') THEN
+                ALTER TABLE employees ADD COLUMN role TEXT DEFAULT 'Працівник';
+            END IF;
+        END $$;""")
         conn.commit(); cur.close(); conn.close()
-        logging.info("✅ БД актуалізована")
-    except Exception as e: logging.error(f"❌ DB Error: {e}")
+    except Exception as e: logging.error(f"DB Error: {e}")
 
 # --- Головне Меню ---
 def main_menu():
@@ -58,37 +55,36 @@ def main_menu():
     builder.button(text="🚍 Маршрути")
     builder.button(text="⚙️ Зміна")
     builder.button(text="🎂 Дні народження")
-    builder.button(text="💬 Поговорити")
-    builder.adjust(1, 1, 2, 1)
+    builder.adjust(1, 1, 2)
     return builder.as_markup(resize_keyboard=True)
 
-# --- Маршрути ---
+# --- Блок Маршрутів ---
 @dp.message(F.text == "🚍 Маршрути")
 async def show_routes(m: types.Message):
     conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
     cur.execute("SELECT info FROM routes ORDER BY id ASC"); rows = cur.fetchall(); cur.close(); conn.close()
-    text = "🚍 **Маршрути:**\n\n" + ("Порожньо" if not rows else "\n".join([f"📍 {r[0]}" for r in rows]))
+    text = "🚍 **Список маршрутів:**\n\n" + ("Порожньо" if not rows else "\n".join([f"📍 {r[0]}" for r in rows]))
     kb = InlineKeyboardBuilder().button(text="➕ Додати", callback_data="r_add").button(text="🗑 Видалити", callback_data="r_del_list").adjust(2)
     await m.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 @dp.callback_query(F.data == "r_add")
 async def r_add(c: types.CallbackQuery, state: FSMContext):
-    await c.message.answer("Введіть: Прізвище - Маршрут - Зупинка"); await state.set_state(BotStates.waiting_for_route_data)
+    await c.message.answer("Пришліть: Прізвище - Маршрут - Зупинка"); await state.set_state(BotStates.waiting_for_route_data)
 
 @dp.message(BotStates.waiting_for_route_data)
 async def r_save(m: types.Message, state: FSMContext):
     conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
     cur.execute("INSERT INTO routes (info) VALUES (%s)", (m.text,)); conn.commit(); cur.close(); conn.close()
-    await m.answer("✅ Маршрут збережено!", reply_markup=main_menu()); await state.clear()
+    await m.answer("✅ Маршрут збережено!"); await state.clear()
 
 @dp.callback_query(F.data == "r_del_list")
 async def r_del_l(c: types.CallbackQuery):
     conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
     cur.execute("SELECT id, info FROM routes"); rows = cur.fetchall(); cur.close(); conn.close()
     kb = InlineKeyboardBuilder()
-    for rid, info in rows: kb.button(text=f"❌ {info[:25]}", callback_data=f"rdel_{rid}")
+    for rid, info in rows: kb.button(text=f"❌ {info[:25]}...", callback_data=f"rdel_{rid}")
     kb.adjust(1).row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="back_r"))
-    await c.message.edit_text("Видалення маршрутів:", reply_markup=kb.as_markup())
+    await c.message.edit_text("Видалити маршрут:", reply_markup=kb.as_markup())
 
 @dp.callback_query(F.data.startswith("rdel_"))
 async def r_delete(c: types.CallbackQuery):
@@ -97,7 +93,7 @@ async def r_delete(c: types.CallbackQuery):
     await r_del_l(c)
 
 @dp.callback_query(F.data == "back_r")
-async def back_r(c: types.CallbackQuery): await show_routes(c.message); await c.answer()
+async def back_r(c: types.CallbackQuery): await show_routes(c.message)
 
 # --- Дні Народження ---
 @dp.message(F.text == "🎂 Дні народження")
@@ -116,13 +112,13 @@ async def e_list(c: types.CallbackQuery):
     rows = cur.fetchall(); cur.close(); conn.close()
     res = {"Керівники": [], "Працівники": []}
     for n, d, r in rows: res[r if r in res else "Працівники"].append(f"{d.strftime('%d.%m')} — {n}")
-    txt = "📜 **СПИСОК:**\n\n⭐ **КЕРІВНИКИ:**\n" + ("-" if not res["Керівники"] else "\n".join(res["Керівники"]))
+    txt = "📜 **ЗАГАЛЬНИЙ СПИСОК:**\n\n⭐ **КЕРІВНИКИ:**\n" + ("-" if not res["Керівники"] else "\n".join(res["Керівники"]))
     txt += "\n\n👥 **ПРАЦІВНИКИ:**\n" + ("-" if not res["Працівники"] else "\n".join(res["Працівники"]))
     await c.message.answer(txt, parse_mode="Markdown"); await c.answer()
 
 @dp.callback_query(F.data == "e_add")
 async def e_add(c: types.CallbackQuery, state: FSMContext):
-    await c.message.answer("Формат: Прізвище Ім'я - ДД.ММ.РРРР"); await state.set_state(BotStates.waiting_for_employee_data)
+    await c.message.answer("Введіть: Прізвище Ім'я - ДД.ММ.РРРР"); await state.set_state(BotStates.waiting_for_employee_data)
 
 @dp.message(BotStates.waiting_for_employee_data)
 async def e_save1(m: types.Message, state: FSMContext):
@@ -130,8 +126,8 @@ async def e_save1(m: types.Message, state: FSMContext):
         p = m.text.split(" - "); datetime.strptime(p[1].strip(), "%d.%m.%Y")
         await state.update_data(name=p[0].strip(), bday=p[1].strip())
         kb = InlineKeyboardBuilder().button(text="⭐ Керівник", callback_data="erole_Керівник").button(text="👥 Працівник", callback_data="erole_Працівник")
-        await m.answer("Оберіть роль:", reply_markup=kb.as_markup()); await state.set_state(BotStates.waiting_for_employee_role)
-    except: await m.answer("❌ Помилка! Треба: Прізвище Ім'я - 01.01.1990")
+        await m.answer("Оберіть категорію:", reply_markup=kb.as_markup()); await state.set_state(BotStates.waiting_for_employee_role)
+    except: await m.answer("❌ Помилка! Формат: Прізвище Ім'я - 01.01.1990")
 
 @dp.callback_query(F.data.startswith("erole_"))
 async def e_save2(c: types.CallbackQuery, state: FSMContext):
@@ -139,7 +135,7 @@ async def e_save2(c: types.CallbackQuery, state: FSMContext):
     conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
     cur.execute("INSERT INTO employees (full_name, birth_date, role) VALUES (%s, %s, %s)", (data['name'], d, role))
     conn.commit(); cur.close(); conn.close()
-    await c.message.edit_text(f"✅ {data['name']} доданий!"); await state.clear()
+    await c.message.edit_text(f"✅ {data['name']} доданий до списку!"); await state.clear()
 
 @dp.callback_query(F.data == "e_del_l")
 async def e_del_l(c: types.CallbackQuery):
@@ -148,7 +144,7 @@ async def e_del_l(c: types.CallbackQuery):
     kb = InlineKeyboardBuilder()
     for eid, name in rows: kb.button(text=f"🗑 {name}", callback_data=f"ed_{eid}")
     kb.adjust(1).row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="back_bday"))
-    await c.message.edit_text("Видалити працівника:", reply_markup=kb.as_markup())
+    await c.message.edit_text("Видалити зі списку ДН:", reply_markup=kb.as_markup())
 
 @dp.callback_query(F.data.startswith("ed_"))
 async def e_del_do(c: types.CallbackQuery):
@@ -157,7 +153,7 @@ async def e_del_do(c: types.CallbackQuery):
     await e_del_l(c)
 
 @dp.callback_query(F.data == "back_bday")
-async def back_b(c: types.CallbackQuery): await bday_m(c.message); await c.answer()
+async def back_b(c: types.CallbackQuery): await bday_m(c.message)
 
 # --- Завдання ---
 async def t_kb():
@@ -173,7 +169,7 @@ async def t_kb():
     return kb.as_markup()
 
 @dp.message(F.text == "📋 Завдання на зміну")
-async def show_t(m: types.Message): await m.answer("Завдання:", reply_markup=await t_kb())
+async def show_t(m: types.Message): await m.answer("Ваші завдання:", reply_markup=await t_kb())
 
 @dp.callback_query(F.data.startswith("tgl_"))
 async def tgl(c: types.CallbackQuery):
@@ -183,19 +179,19 @@ async def tgl(c: types.CallbackQuery):
 
 @dp.callback_query(F.data == "t_fin")
 async def t_fin(c: types.CallbackQuery):
-    await c.message.answer("🎊 Вдалої зміни!"); conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
+    await c.message.answer("🎊 Вдалої зміни! Завдання обнулено."); conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
     cur.execute("UPDATE tasks SET is_done = FALSE"); conn.commit(); cur.close(); conn.close()
     await c.message.edit_reply_markup(reply_markup=await t_kb())
 
 @dp.callback_query(F.data == "t_add")
 async def t_add(c: types.CallbackQuery, state: FSMContext):
-    await c.message.answer("Назва завдання:"); await state.set_state(BotStates.waiting_for_task_name)
+    await c.message.answer("Напишіть завдання:"); await state.set_state(BotStates.waiting_for_task_name)
 
 @dp.message(BotStates.waiting_for_task_name)
 async def t_save(m: types.Message, state: FSMContext):
     conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
     cur.execute("INSERT INTO tasks (title) VALUES (%s)", (m.text,)); conn.commit(); cur.close(); conn.close()
-    await m.answer("✅ Додано!"); await state.clear()
+    await m.answer("✅ Додано до списку!"); await state.clear()
 
 @dp.callback_query(F.data == "t_del_l")
 async def t_del_l(c: types.CallbackQuery):
@@ -215,7 +211,7 @@ async def t_del_do(c: types.CallbackQuery):
 @dp.callback_query(F.data == "back_t")
 async def back_t(c: types.CallbackQuery): await c.message.edit_text("Завдання:", reply_markup=await t_kb())
 
-# --- Решта ---
+# --- Нагадування та Зміна ---
 async def reminders():
     now = datetime.now()
     if now.weekday() > 5: return
@@ -230,34 +226,25 @@ async def reminders():
 @dp.message(F.text == "⚙️ Зміна")
 async def shift_m(m: types.Message):
     kb = InlineKeyboardBuilder().button(text="☀️ День (07:43)", callback_data="s_day").button(text="🌙 Ніч (16:43)", callback_data="s_night").button(text="🚀 ТЕСТ", callback_data="s_test").adjust(1)
-    await m.answer("Графік Пн-Сб:", reply_markup=kb.as_markup())
+    await m.answer("Оберіть свій графік:", reply_markup=kb.as_markup())
 
 @dp.callback_query(F.data.startswith("s_"))
 async def s_set(c: types.CallbackQuery):
-    if c.data == "s_test": await c.message.answer("Тест: Вітаю, яка кількість працівників?"); return
+    if c.data == "s_test": await c.message.answer("Тест нагадування: Вітаю, яка кількість працівників?"); return
     s = "day" if "day" in c.data else "night"
     conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
     cur.execute("UPDATE users SET shift_type = %s WHERE user_id = %s", (s, c.from_user.id)); conn.commit(); cur.close(); conn.close()
-    await c.answer(f"Встановлено: {s}")
+    await c.answer(f"Збережено: {s}")
 
 @dp.message(Command("start"))
 async def start(m: types.Message):
     init_db(); conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
     cur.execute("INSERT INTO users (user_id, username) VALUES (%s, %s) ON CONFLICT DO NOTHING", (m.from_user.id, m.from_user.username)); conn.commit(); cur.close(); conn.close()
-    await m.answer("👋 Бот запущений!", reply_markup=main_menu())
+    await m.answer("👋 Вітаю! Бот готовий до роботи.", reply_markup=main_menu())
 
-@dp.message(F.text == "💬 Поговорити")
-async def talk(m: types.Message): await m.answer("Я слухаю...")
-
-@dp.message(F.text)
-async def ai(m: types.Message):
-    try:
-        res = client.chat.completions.create(model="google/gemini-2.0-flash-exp:free", messages=[{"role": "user", "content": m.text}])
-        await m.answer(res.choices[0].message.content)
-    except: await m.answer("ШІ зайнятий.")
-
+# --- Запуск ---
 async def main():
-    init_db(); await bot.delete_webhook(drop_pending_updates=True); await asyncio.sleep(2)
+    init_db(); await bot.delete_webhook(drop_pending_updates=True)
     scheduler.add_job(reminders, "interval", minutes=1); scheduler.start()
     app = web.Application(); app.router.add_get("/", lambda r: web.Response(text="OK"))
     runner = web.AppRunner(app); await runner.setup()
