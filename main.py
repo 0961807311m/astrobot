@@ -47,8 +47,8 @@ def init_db():
         conn.commit(); cur.close(); conn.close()
     except Exception as e: logging.error(f"❌ DB Error: {e}")
 
-def migrate_to_managers():
-    """Переносить вказаних людей у категорію Керівники"""
+def fix_manager_roles():
+    """Автоматично переносить вказаних людей у розділ Керівники"""
     managers = [
         "Костюк Леся", "Склярук Анатолій", "Квартюк Іван", "Коваль Мирослава", "Селіверстов Олег", 
         "Хоха", "Полігас Андрій", "Козак Олег", "Лиховид Сергій Миколайович", "Маснюк Олександр", 
@@ -61,7 +61,7 @@ def migrate_to_managers():
         for name in managers:
             cur.execute("UPDATE employees SET role = 'Керівник' WHERE full_name = %s", (name,))
         conn.commit(); cur.close(); conn.close()
-        logging.info("✅ Ролі керівників оновлено")
+        logging.info("✅ Ролі керівників виправлено")
     except Exception as e: logging.error(f"Migration error: {e}")
 
 # --- Меню ---
@@ -102,7 +102,7 @@ async def bday_m(m: types.Message):
 @dp.callback_query(F.data == "e_list")
 async def e_list(c: types.CallbackQuery):
     conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
-    # Сортування: Спочатку роль, потім МІСЯЦЬ, потім ДЕНЬ
+    # Сортування: Спочатку Керівники, потім Працівники. Всередині груп - за місяцем і днем (січень-грудень)
     cur.execute("""
         SELECT full_name, birth_date, role FROM employees 
         ORDER BY CASE WHEN role='Керівник' THEN 1 ELSE 2 END, 
@@ -113,51 +113,12 @@ async def e_list(c: types.CallbackQuery):
     res = {"Керівники": [], "Працівники": []}
     for n, d, r in rows:
         res[r if r in res else "Працівники"].append(f"{d.strftime('%d.%m')} — {n}")
+    
     txt = "📜 **СПИСОК:**\n\n⭐ **КЕРІВНИКИ:**\n" + ("-" if not res["Керівники"] else "\n".join(res["Керівники"]))
     txt += "\n\n👥 **ПРАЦІВНИКИ:**\n" + ("-" if not res["Працівники"] else "\n".join(res["Працівники"]))
     await c.message.answer(txt, parse_mode="Markdown"); await c.answer()
 
-# --- Хендлери для додавання та видалення ---
-@dp.callback_query(F.data == "e_add")
-async def e_add(c: types.CallbackQuery, state: FSMContext):
-    await c.message.answer("Формат: Прізвище Ім'я - ДД.ММ.РРРР"); await state.set_state(BotStates.waiting_for_employee_data)
-
-@dp.message(BotStates.waiting_for_employee_data)
-async def e_save1(m: types.Message, state: FSMContext):
-    try:
-        p = m.text.split(" - "); datetime.strptime(p[1].strip(), "%d.%m.%Y")
-        await state.update_data(name=p[0].strip(), bday=p[1].strip())
-        kb = InlineKeyboardBuilder().button(text="⭐ Керівник", callback_data="erole_Керівник").button(text="👥 Працівник", callback_data="erole_Працівник")
-        await m.answer("Оберіть категорію:", reply_markup=kb.as_markup()); await state.set_state(BotStates.waiting_for_employee_role)
-    except: await m.answer("❌ Формат: Прізвище Ім'я - 01.01.1990")
-
-@dp.callback_query(F.data.startswith("erole_"))
-async def e_save2(c: types.CallbackQuery, state: FSMContext):
-    role = c.data.split("_")[1]; data = await state.get_data(); d = datetime.strptime(data['bday'], "%d.%m.%Y").date()
-    conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
-    cur.execute("INSERT INTO employees (full_name, birth_date, role) VALUES (%s, %s, %s)", (data['name'], d, role))
-    conn.commit(); cur.close(); conn.close()
-    await c.message.edit_text(f"✅ {data['name']} доданий!"); await state.clear()
-
-@dp.callback_query(F.data == "e_del_l")
-async def e_del_l(c: types.CallbackQuery):
-    conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
-    cur.execute("SELECT id, full_name FROM employees ORDER BY full_name ASC"); rows = cur.fetchall(); cur.close(); conn.close()
-    kb = InlineKeyboardBuilder()
-    for eid, name in rows: kb.button(text=f"🗑 {name}", callback_data=f"ed_{eid}")
-    kb.adjust(1).row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="back_bday"))
-    await c.message.edit_text("Видалити працівника:", reply_markup=kb.as_markup())
-
-@dp.callback_query(F.data.startswith("ed_"))
-async def e_del_do(c: types.CallbackQuery):
-    eid = int(c.data.split("_")[1]); conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
-    cur.execute("DELETE FROM employees WHERE id = %s", (eid,)); conn.commit(); cur.close(); conn.close()
-    await e_del_l(c)
-
-@dp.callback_query(F.data == "back_bday")
-async def back_b(c: types.CallbackQuery): await bday_m(c.message)
-
-# --- Маршрути ---
+# --- Хендлери для Маршрутів ---
 @dp.message(F.text == "🚍 Маршрути")
 async def show_routes(m: types.Message):
     conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
@@ -244,6 +205,46 @@ async def t_del_do(c: types.CallbackQuery):
 @dp.callback_query(F.data == "back_t")
 async def back_t(c: types.CallbackQuery): await c.message.edit_text("Список завдань:", reply_markup=await t_kb())
 
+# --- Налаштування ДН ---
+@dp.callback_query(F.data == "e_add")
+async def e_add(c: types.CallbackQuery, state: FSMContext):
+    await c.message.answer("Прізвище Ім'я - ДД.ММ.РРРР"); await state.set_state(BotStates.waiting_for_employee_data)
+
+@dp.message(BotStates.waiting_for_employee_data)
+async def e_save1(m: types.Message, state: FSMContext):
+    try:
+        p = m.text.split(" - "); datetime.strptime(p[1].strip(), "%d.%m.%Y")
+        await state.update_data(name=p[0].strip(), bday=p[1].strip())
+        kb = InlineKeyboardBuilder().button(text="⭐ Керівник", callback_data="erole_Керівник").button(text="👥 Працівник", callback_data="erole_Працівник")
+        await m.answer("Оберіть категорію:", reply_markup=kb.as_markup()); await state.set_state(BotStates.waiting_for_employee_role)
+    except: await m.answer("❌ Формат: Прізвище Ім'я - 01.01.1990")
+
+@dp.callback_query(F.data.startswith("erole_"))
+async def e_save2(c: types.CallbackQuery, state: FSMContext):
+    role = c.data.split("_")[1]; data = await state.get_data(); d = datetime.strptime(data['bday'], "%d.%m.%Y").date()
+    conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
+    cur.execute("INSERT INTO employees (full_name, birth_date, role) VALUES (%s, %s, %s)", (data['name'], d, role))
+    conn.commit(); cur.close(); conn.close()
+    await c.message.edit_text(f"✅ {data['name']} доданий!"); await state.clear()
+
+@dp.callback_query(F.data == "e_del_l")
+async def e_del_l(c: types.CallbackQuery):
+    conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
+    cur.execute("SELECT id, full_name FROM employees ORDER BY full_name ASC"); rows = cur.fetchall(); cur.close(); conn.close()
+    kb = InlineKeyboardBuilder()
+    for eid, name in rows: kb.button(text=f"🗑 {name}", callback_data=f"ed_{eid}")
+    kb.adjust(1).row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="back_bday"))
+    await c.message.edit_text("Видалити працівника:", reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data.startswith("ed_"))
+async def e_del_do(c: types.CallbackQuery):
+    eid = int(c.data.split("_")[1]); conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
+    cur.execute("DELETE FROM employees WHERE id = %s", (eid,)); conn.commit(); cur.close(); conn.close()
+    await e_del_l(c)
+
+@dp.callback_query(F.data == "back_bday")
+async def back_b(c: types.CallbackQuery): await bday_m(c.message)
+
 # --- Зміна та Старт ---
 @dp.message(F.text == "⚙️ Зміна")
 async def shift_m(m: types.Message):
@@ -260,11 +261,11 @@ async def s_set(c: types.CallbackQuery):
 @dp.message(Command("start"))
 async def start(m: types.Message):
     init_db()
-    migrate_to_managers() # ОНОВЛЮЄМО КЕРІВНИКІВ
+    fix_manager_roles() # ВИПРАВЛЯЄМО РОЛІ ПРИ ЗАПУСКУ
     conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
     cur.execute("INSERT INTO users (user_id, username) VALUES (%s, %s) ON CONFLICT DO NOTHING", (m.from_user.id, m.from_user.username))
     conn.commit(); cur.close(); conn.close()
-    await m.answer("👋 Бот готовий! Список оновлено.", reply_markup=main_menu())
+    await m.answer("👋 Бот готовий! Список Керівників виправлено.", reply_markup=main_menu())
 
 @dp.message()
 async def any_text(m: types.Message):
