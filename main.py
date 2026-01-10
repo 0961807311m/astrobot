@@ -70,7 +70,7 @@ async def get_tasks_kb():
 @dp.message(F.text == "📋 Завдання на зміну")
 async def show_tasks(m: types.Message, state: FSMContext):
     await state.clear()
-    await m.answer("📝 Список завдань на зміну:", reply_markup=await get_tasks_kb())
+    await m.answer("📝 Список завдання:", reply_markup=await get_tasks_kb())
 
 @dp.callback_query(F.data.startswith("tgl_"))
 async def toggle_task(c: types.CallbackQuery):
@@ -103,7 +103,7 @@ async def t_del_menu(c: types.CallbackQuery):
     kb = InlineKeyboardBuilder()
     for tid, title in rows: kb.button(text=f"❌ {title}", callback_data=f"tdel_{tid}")
     kb.adjust(1); kb.row(types.InlineKeyboardButton(text="🔙 Назад", callback_data="t_back"))
-    await c.message.edit_text("🗑 Оберіть завдання для видалення:", reply_markup=kb.as_markup())
+    await c.message.edit_text("🗑 Оберіть для видалення:", reply_markup=kb.as_markup())
 
 @dp.callback_query(F.data.startswith("tdel_"))
 async def t_del_exec(c: types.CallbackQuery):
@@ -132,8 +132,10 @@ async def e_list(c: types.CallbackQuery):
         line = f"{date.strftime('%d.%m')} — {name}"
         if any(m_name in name for m_name in MANAGERS_NAMES): res["Керівники"].append(line)
         else: res["Працівники"].append(line)
+    
+    # ТУТ БУЛА ПОМИЛКА, ВИПРАВЛЕНО: Працівники замість Прачивники
     txt = "📜 **СПИСОК:**\n\n⭐ **КЕРІВНИКИ:**\n" + ("-" if not res["Керівники"] else "\n".join(res["Керівники"]))
-    txt += "\n\n👥 **ПРАЦІВНИКИ:**\n" + ("-" if not res["Працівники"] else "\n".join(res["Прачивники"]))
+    txt += "\n\n👥 **ПРАЦІВНИКИ:**\n" + ("-" if not res["Працівники"] else "\n".join(res["Працівники"]))
     await c.message.answer(txt, parse_mode="Markdown"); await c.answer()
 
 @dp.callback_query(F.data == "e_add")
@@ -184,20 +186,6 @@ async def r_add_save(m: types.Message, state: FSMContext):
     cur.execute("INSERT INTO routes (info) VALUES (%s)", (m.text,)); conn.commit(); cur.close(); conn.close()
     await m.answer("✅ Додано!"); await state.clear()
 
-# --- Блок: ЗМІНА ---
-@dp.message(F.text == "⚙️ Зміна")
-async def change_shift(m: types.Message, state: FSMContext):
-    await state.clear()
-    kb = InlineKeyboardBuilder().button(text="☀️ День", callback_data="s_day").button(text="🌙 Ніч", callback_data="s_night").adjust(1)
-    await m.answer("Оберіть зміну для нагадувань:", reply_markup=kb.as_markup())
-
-@dp.callback_query(F.data.startswith("s_"))
-async def set_shift(c: types.CallbackQuery):
-    s = "day" if "day" in c.data else "night"
-    conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
-    cur.execute("UPDATE users SET shift_type = %s WHERE user_id = %s", (s, c.from_user.id)); conn.commit(); cur.close(); conn.close()
-    await c.message.answer(f"✅ Встановлено графік: {s.upper()}"); await c.answer()
-
 # --- СИСТЕМНЕ ---
 async def check_reminders():
     now = datetime.now(KYIV_TZ)
@@ -210,6 +198,19 @@ async def check_reminders():
             if (s == 'day' and t == "07:43") or (s == 'night' and t == "16:43"):
                 await bot.send_message(uid, "🔔 Нагадування: Подайте кількість персоналу!")
     except Exception as e: logging.error(f"Err: {e}")
+
+@dp.message(F.text == "⚙️ Зміна")
+async def change_shift(m: types.Message, state: FSMContext):
+    await state.clear()
+    kb = InlineKeyboardBuilder().button(text="☀️ День", callback_data="s_day").button(text="🌙 Ніч", callback_data="s_night").adjust(1)
+    await m.answer("Оберіть зміну:", reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data.startswith("s_"))
+async def set_shift(c: types.CallbackQuery):
+    s = "day" if "day" in c.data else "night"
+    conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
+    cur.execute("UPDATE users SET shift_type = %s WHERE user_id = %s", (s, c.from_user.id)); conn.commit(); cur.close(); conn.close()
+    await c.message.answer(f"✅ Встановлено: {s.upper()}"); await c.answer()
 
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message, state: FSMContext):
@@ -226,14 +227,11 @@ async def any_msg(m: types.Message):
 async def main():
     init_db()
     await bot.delete_webhook(drop_pending_updates=True)
-    await asyncio.sleep(1) # Захист від ConflictError
+    await asyncio.sleep(1)
     scheduler.add_job(check_reminders, "interval", minutes=1); scheduler.start()
-    
     app = web.Application(); app.router.add_get("/", lambda r: web.Response(text="OK"))
     runner = web.AppRunner(app); await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', 10000).start()
-    
-    logging.info("Starting bot...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__": asyncio.run(main())
