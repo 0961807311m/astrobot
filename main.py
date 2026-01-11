@@ -54,7 +54,17 @@ def main_menu():
     builder.adjust(1, 1, 2)
     return builder.as_markup(resize_keyboard=True)
 
-# --- Блок: ЗАВДАННЯ ---
+# --- 1. КОМАНДА START (Найвищий пріоритет) ---
+@dp.message(Command("start"))
+async def cmd_start(m: types.Message, state: FSMContext):
+    await state.clear()
+    init_db()
+    conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
+    cur.execute("INSERT INTO users (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING", (m.from_user.id, m.from_user.username))
+    conn.commit(); cur.close(); conn.close()
+    await m.answer("👋 Вітаю! Я Ваш робочий помічник. Оберіть розділ:", reply_markup=main_menu())
+
+# --- 2. Блок: ЗАВДАННЯ ---
 async def get_tasks_kb():
     conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
     cur.execute("SELECT id, title, is_done FROM tasks ORDER BY id ASC")
@@ -70,7 +80,7 @@ async def get_tasks_kb():
 @dp.message(F.text == "📋 Завдання на зміну")
 async def show_tasks(m: types.Message, state: FSMContext):
     await state.clear()
-    await m.answer("📝 Список завдання:", reply_markup=await get_tasks_kb())
+    await m.answer("📝 Список завдань:", reply_markup=await get_tasks_kb())
 
 @dp.callback_query(F.data.startswith("tgl_"))
 async def toggle_task(c: types.CallbackQuery):
@@ -94,7 +104,7 @@ async def t_add_start(c: types.CallbackQuery, state: FSMContext):
 async def t_add_save(m: types.Message, state: FSMContext):
     conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
     cur.execute("INSERT INTO tasks (title) VALUES (%s)", (m.text,)); conn.commit(); cur.close(); conn.close()
-    await m.answer("✅ Завдання додано!", reply_markup=main_menu()); await state.clear()
+    await m.answer("✅ Завдання додано!"); await state.clear()
 
 @dp.callback_query(F.data == "t_del_menu")
 async def t_del_menu(c: types.CallbackQuery):
@@ -103,7 +113,7 @@ async def t_del_menu(c: types.CallbackQuery):
     kb = InlineKeyboardBuilder()
     for tid, title in rows: kb.button(text=f"❌ {title}", callback_data=f"tdel_{tid}")
     kb.adjust(1); kb.row(types.InlineKeyboardButton(text="🔙 Назад", callback_data="t_back"))
-    await c.message.edit_text("🗑 Оберіть для видалення:", reply_markup=kb.as_markup())
+    await c.message.edit_text("🗑 Видалення завдань:", reply_markup=kb.as_markup())
 
 @dp.callback_query(F.data.startswith("tdel_"))
 async def t_del_exec(c: types.CallbackQuery):
@@ -115,12 +125,51 @@ async def t_del_exec(c: types.CallbackQuery):
 async def t_back(c: types.CallbackQuery):
     await c.message.edit_text("📝 Список завдань:", reply_markup=await get_tasks_kb())
 
-# --- Блок: ДНІ НАРОДЖЕННЯ ---
+# --- 3. Блок: МАРШРУТИ ---
+@dp.message(F.text == "🚍 Маршрути")
+async def show_routes(m: types.Message, state: FSMContext):
+    await state.clear()
+    conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
+    cur.execute("SELECT id, info FROM routes ORDER BY id ASC"); rows = cur.fetchall(); cur.close(); conn.close()
+    txt = "🚍 **Маршрути розвозки:**\n\n" + ("-" if not rows else "\n".join([f"📍 {r[1]}" for r in rows]))
+    kb = InlineKeyboardBuilder().button(text="➕ Додати", callback_data="r_add").button(text="🗑 Видалити", callback_data="r_del_list").adjust(2)
+    await m.answer(txt, reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+@dp.callback_query(F.data == "r_add")
+async def r_add_start(c: types.CallbackQuery, state: FSMContext):
+    await c.message.answer("Введіть дані (Прізвище - Зупинка):"); await state.set_state(BotStates.waiting_for_route_data)
+
+@dp.message(BotStates.waiting_for_route_data)
+async def r_add_save(m: types.Message, state: FSMContext):
+    conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
+    cur.execute("INSERT INTO routes (info) VALUES (%s)", (m.text,)); conn.commit(); cur.close(); conn.close()
+    await m.answer("✅ Зупинку додано!"); await state.clear()
+
+@dp.callback_query(F.data == "r_del_list")
+async def r_del_list(c: types.CallbackQuery):
+    conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
+    cur.execute("SELECT id, info FROM routes"); rows = cur.fetchall(); cur.close(); conn.close()
+    kb = InlineKeyboardBuilder()
+    for rid, info in rows: kb.button(text=f"❌ {info[:20]}", callback_data=f"rdel_{rid}")
+    kb.adjust(1).row(types.InlineKeyboardButton(text="🔙 Назад", callback_data="r_back_main"))
+    await c.message.edit_text("🗑 Оберіть зупинку для видалення:", reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data.startswith("rdel_"))
+async def r_del_exec(c: types.CallbackQuery):
+    rid = int(c.data.split("_")[1]); conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
+    cur.execute("DELETE FROM routes WHERE id = %s", (rid,)); conn.commit(); cur.close(); conn.close()
+    await c.answer("Видалено"); await r_del_list(c)
+
+@dp.callback_query(F.data == "r_back_main")
+async def r_back(c: types.CallbackQuery, state: FSMContext):
+    await show_routes(c.message, state); await c.answer()
+
+# --- 4. Блок: ДНІ НАРОДЖЕННЯ ---
 @dp.message(F.text == "🎂 Дні народження")
 async def bday_menu(m: types.Message, state: FSMContext):
     await state.clear()
     kb = InlineKeyboardBuilder().button(text="➕ Додати", callback_data="e_add").button(text="📜 Список", callback_data="e_list").button(text="🗑 Видалити", callback_data="e_del_l").adjust(2, 1)
-    await m.answer("🎂 Розділ Днів народження:", reply_markup=kb.as_markup())
+    await m.answer("🎂 Керування іменинниками:", reply_markup=kb.as_markup())
 
 @dp.callback_query(F.data == "e_list")
 async def e_list(c: types.CallbackQuery):
@@ -132,15 +181,13 @@ async def e_list(c: types.CallbackQuery):
         line = f"{date.strftime('%d.%m')} — {name}"
         if any(m_name in name for m_name in MANAGERS_NAMES): res["Керівники"].append(line)
         else: res["Працівники"].append(line)
-    
-    # ТУТ БУЛА ПОМИЛКА, ВИПРАВЛЕНО: Працівники замість Прачивники
     txt = "📜 **СПИСОК:**\n\n⭐ **КЕРІВНИКИ:**\n" + ("-" if not res["Керівники"] else "\n".join(res["Керівники"]))
     txt += "\n\n👥 **ПРАЦІВНИКИ:**\n" + ("-" if not res["Працівники"] else "\n".join(res["Працівники"]))
     await c.message.answer(txt, parse_mode="Markdown"); await c.answer()
 
 @dp.callback_query(F.data == "e_add")
 async def e_add_start(c: types.CallbackQuery, state: FSMContext):
-    await c.message.answer("Пришліть дані: Прізвище Ім'я - ДД.ММ.РРРР"); await state.set_state(BotStates.waiting_for_employee_data)
+    await c.message.answer("Пришліть: Прізвище Ім'я - ДД.ММ.РРРР"); await state.set_state(BotStates.waiting_for_employee_data)
 
 @dp.message(BotStates.waiting_for_employee_data)
 async def e_add_save(m: types.Message, state: FSMContext):
@@ -149,16 +196,16 @@ async def e_add_save(m: types.Message, state: FSMContext):
         conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
         cur.execute("INSERT INTO employees (full_name, birth_date) VALUES (%s, %s)", (p[0].strip(), d))
         conn.commit(); cur.close(); conn.close()
-        await m.answer("✅ Додано!"); await state.clear()
-    except: await m.answer("❌ Формат: Прізвище Ім'я - 01.01.1990")
+        await m.answer("✅ Успішно додано!"); await state.clear()
+    except: await m.answer("❌ Помилка. Формат: Шевченко Тарас - 09.03.1814")
 
 @dp.callback_query(F.data == "e_del_l")
 async def e_del_l(c: types.CallbackQuery):
     conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
     cur.execute("SELECT id, full_name FROM employees ORDER BY full_name"); rows = cur.fetchall(); cur.close(); conn.close()
     kb = InlineKeyboardBuilder()
-    for eid, name in rows: kb.button(text=f"🗑 {name}", callback_data=f"ed_{eid}")
-    kb.adjust(1); await c.message.edit_text("Оберіть кого видалити:", reply_markup=kb.as_markup())
+    for eid, name in rows: kb.button(text=f"🗑 {name[:25]}", callback_data=f"ed_{eid}")
+    kb.adjust(1); await c.message.edit_text("🗑 Кого видалити?", reply_markup=kb.as_markup())
 
 @dp.callback_query(F.data.startswith("ed_"))
 async def e_del_do(c: types.CallbackQuery):
@@ -166,27 +213,20 @@ async def e_del_do(c: types.CallbackQuery):
     cur.execute("DELETE FROM employees WHERE id = %s", (eid,)); conn.commit(); cur.close(); conn.close()
     await c.answer("Видалено!"); await e_list(c)
 
-# --- Блок: МАРШРУТИ ---
-@dp.message(F.text == "🚍 Маршрути")
-async def show_routes(m: types.Message, state: FSMContext):
+# --- 5. ЗМІНА ТА НАГАДУВАННЯ ---
+@dp.message(F.text == "⚙️ Зміна")
+async def change_shift(m: types.Message, state: FSMContext):
     await state.clear()
+    kb = InlineKeyboardBuilder().button(text="☀️ День", callback_data="s_day").button(text="🌙 Ніч", callback_data="s_night").adjust(1)
+    await m.answer("Оберіть Вашу зміну:", reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data.startswith("s_"))
+async def set_shift(c: types.CallbackQuery):
+    s = "day" if "day" in c.data else "night"
     conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
-    cur.execute("SELECT info FROM routes ORDER BY id ASC"); rows = cur.fetchall(); cur.close(); conn.close()
-    txt = "🚍 **Маршрути:**\n\n" + ("-" if not rows else "\n".join([f"📍 {r[0]}" for r in rows]))
-    kb = InlineKeyboardBuilder().button(text="➕ Додати", callback_data="r_add").adjust(1)
-    await m.answer(txt, reply_markup=kb.as_markup(), parse_mode="Markdown")
+    cur.execute("UPDATE users SET shift_type = %s WHERE user_id = %s", (s, c.from_user.id)); conn.commit(); cur.close(); conn.close()
+    await c.message.answer(f"✅ Встановлено графік: {s.upper()}"); await c.answer()
 
-@dp.callback_query(F.data == "r_add")
-async def r_add_start(c: types.CallbackQuery, state: FSMContext):
-    await c.message.answer("Введіть маршрут:"); await state.set_state(BotStates.waiting_for_route_data)
-
-@dp.message(BotStates.waiting_for_route_data)
-async def r_add_save(m: types.Message, state: FSMContext):
-    conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
-    cur.execute("INSERT INTO routes (info) VALUES (%s)", (m.text,)); conn.commit(); cur.close(); conn.close()
-    await m.answer("✅ Додано!"); await state.clear()
-
-# --- СИСТЕМНЕ ---
 async def check_reminders():
     now = datetime.now(KYIV_TZ)
     if now.weekday() > 4: return
@@ -199,39 +239,25 @@ async def check_reminders():
                 await bot.send_message(uid, "🔔 Нагадування: Подайте кількість персоналу!")
     except Exception as e: logging.error(f"Err: {e}")
 
-@dp.message(F.text == "⚙️ Зміна")
-async def change_shift(m: types.Message, state: FSMContext):
-    await state.clear()
-    kb = InlineKeyboardBuilder().button(text="☀️ День", callback_data="s_day").button(text="🌙 Ніч", callback_data="s_night").adjust(1)
-    await m.answer("Оберіть зміну:", reply_markup=kb.as_markup())
-
-@dp.callback_query(F.data.startswith("s_"))
-async def set_shift(c: types.CallbackQuery):
-    s = "day" if "day" in c.data else "night"
-    conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
-    cur.execute("UPDATE users SET shift_type = %s WHERE user_id = %s", (s, c.from_user.id)); conn.commit(); cur.close(); conn.close()
-    await c.message.answer(f"✅ Встановлено: {s.upper()}"); await c.answer()
-
-@dp.message(Command("start"))
-async def cmd_start(m: types.Message, state: FSMContext):
-    await state.clear(); init_db()
-    conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
-    cur.execute("INSERT INTO users (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING", (m.from_user.id, m.from_user.username))
-    conn.commit(); cur.close(); conn.close()
-    await m.answer("👋 Бот запущено!", reply_markup=main_menu())
-
+# --- 6. ЗАГАЛЬНИЙ ОБРОБНИК ---
 @dp.message()
 async def any_msg(m: types.Message):
-    await m.answer("Скористайтеся меню 👇", reply_markup=main_menu())
+    await m.answer("Будь ласка, використовуйте меню 👇", reply_markup=main_menu())
 
+# --- ЗАПУСК ---
 async def main():
     init_db()
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(1)
     scheduler.add_job(check_reminders, "interval", minutes=1); scheduler.start()
+    
+    # Сервер для Render
     app = web.Application(); app.router.add_get("/", lambda r: web.Response(text="OK"))
     runner = web.AppRunner(app); await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', 10000).start()
+    
+    logging.info("ASTRO BOT STARTED")
     await dp.start_polling(bot)
 
-if __name__ == "__main__": asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
