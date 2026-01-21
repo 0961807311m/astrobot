@@ -3,7 +3,7 @@ import asyncio
 import logging
 import psycopg2
 import pytz
-from datetime import datetime
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
@@ -43,6 +43,14 @@ def init_db():
     cur.execute("CREATE TABLE IF NOT EXISTS employees (id SERIAL PRIMARY KEY, full_name TEXT, birth_date DATE);")
     cur.execute("CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, title TEXT, is_done BOOLEAN DEFAULT FALSE);")
     cur.execute("CREATE TABLE IF NOT EXISTS routes (id SERIAL PRIMARY KEY, info TEXT);")
+    
+    # Оновлення таблиці tasks для нагадувань (якщо колонки немає)
+    try:
+        cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS remind_at TIMESTAMP;")
+    except Exception as e:
+        logging.info(f"DB Update info: {e}")
+        conn.rollback()
+    
     conn.commit(); cur.close(); conn.close()
 
 def main_menu():
@@ -54,7 +62,7 @@ def main_menu():
     builder.adjust(1, 1, 2)
     return builder.as_markup(resize_keyboard=True)
 
-# --- 1. КОМАНДА START (Найвищий пріоритет) ---
+# --- 1. START ---
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message, state: FSMContext):
     await state.clear()
@@ -62,16 +70,18 @@ async def cmd_start(m: types.Message, state: FSMContext):
     conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
     cur.execute("INSERT INTO users (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING", (m.from_user.id, m.from_user.username))
     conn.commit(); cur.close(); conn.close()
-    await m.answer("👋 Вітаю! Я Ваш робочий помічник. Оберіть розділ:", reply_markup=main_menu())
+    await m.answer("👋 Вітаю! Я оновився і готовий до роботи.", reply_markup=main_menu())
 
-# --- 2. Блок: ЗАВДАННЯ ---
+# --- 2. ЗАВДАННЯ + НАГАДУВАННЯ ---
 async def get_tasks_kb():
     conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
-    cur.execute("SELECT id, title, is_done FROM tasks ORDER BY id ASC")
+    cur.execute("SELECT id, title, is_done, remind_at FROM tasks ORDER BY id ASC")
     rows = cur.fetchall(); cur.close(); conn.close()
     kb = InlineKeyboardBuilder()
-    for tid, title, done in rows:
-        kb.button(text=f"{'✅' if done else '⬜'} {title}", callback_data=f"tgl_{tid}")
+    for tid, title, done, remind_at in rows:
+        icon = "✅" if done else "⬜"
+        clock = "⏰" if (remind_at and not done) else ""
+        kb.button(text=f"{icon} {title} {clock}", callback_data=f"tgl_{tid}")
     kb.adjust(1)
     kb.row(types.InlineKeyboardButton(text="➕ Додати", callback_data="t_add"),
            types.InlineKeyboardButton(text="🗑 Видалити", callback_data="t_del_menu"))
@@ -86,14 +96,16 @@ async def show_tasks(m: types.Message, state: FSMContext):
 async def toggle_task(c: types.CallbackQuery):
     tid = int(c.data.split("_")[1])
     conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
-    cur.execute("UPDATE tasks SET is_done = NOT is_done WHERE id = %s", (tid,))
+    # Якщо виконуємо завдання - прибираємо нагадування
+    cur.execute("UPDATE tasks SET is_done = NOT is_done, remind_at = NULL WHERE id = %s", (tid,))
     conn.commit()
     cur.execute("SELECT count(*) FROM tasks WHERE is_done = FALSE")
     remaining = cur.fetchone()[0]
     cur.close(); conn.close()
+    
     await c.message.edit_reply_markup(reply_markup=await get_tasks_kb())
     if remaining == 0:
-        await c.message.answer("🎉 Вітаю! Усі завдання на сьогодні виконано!")
+        await c.message.answer("🎉 Усі завдання виконано!")
     await c.answer()
 
 @dp.callback_query(F.data == "t_add")
@@ -103,8 +115,37 @@ async def t_add_start(c: types.CallbackQuery, state: FSMContext):
 @dp.message(BotStates.waiting_for_task_name)
 async def t_add_save(m: types.Message, state: FSMContext):
     conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
-    cur.execute("INSERT INTO tasks (title) VALUES (%s)", (m.text,)); conn.commit(); cur.close(); conn.close()
-    await m.answer("✅ Завдання додано!"); await state.clear()
+    cur.execute("INSERT INTO tasks (title) VALUES (%s) RETURNING id", (m.text,))
+    new_id = cur.fetchone()[0]
+    conn.commit(); cur.close(); conn.close()
+    
+    # Пропонуємо додати нагадування
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⏰ Через 1 год", callback_data=f"rem_{new_id}_60")
+    kb.button(text="⏰ Через 2 год", callback_data=f"rem_{new_id}_120")
+    kb.button(text="❌ Без нагадування", callback_data="rem_skip")
+    kb.adjust(2, 1)
+    
+    await m.answer(f"✅ Завдання '{m.text}' створено! Нагадати про нього?", reply_markup=kb.as_markup())
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("rem_"))
+async def set_reminder(c: types.CallbackQuery):
+    if c.data == "rem_skip":
+        await c.message.edit_text("✅ Завдання додано без нагадування.", reply_markup=await get_tasks_kb())
+        return
+
+    parts = c.data.split("_")
+    tid = int(parts[1])
+    minutes = int(parts[2])
+    
+    remind_time = datetime.now(KYIV_TZ) + timedelta(minutes=minutes)
+    
+    conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
+    cur.execute("UPDATE tasks SET remind_at = %s WHERE id = %s", (remind_time, tid))
+    conn.commit(); cur.close(); conn.close()
+    
+    await c.message.edit_text(f"✅ Нагадування встановлено на {remind_time.strftime('%H:%M')}!", reply_markup=await get_tasks_kb())
 
 @dp.callback_query(F.data == "t_del_menu")
 async def t_del_menu(c: types.CallbackQuery):
@@ -125,7 +166,7 @@ async def t_del_exec(c: types.CallbackQuery):
 async def t_back(c: types.CallbackQuery):
     await c.message.edit_text("📝 Список завдань:", reply_markup=await get_tasks_kb())
 
-# --- 3. Блок: МАРШРУТИ ---
+# --- 3. МАРШРУТИ ---
 @dp.message(F.text == "🚍 Маршрути")
 async def show_routes(m: types.Message, state: FSMContext):
     await state.clear()
@@ -164,7 +205,7 @@ async def r_del_exec(c: types.CallbackQuery):
 async def r_back(c: types.CallbackQuery, state: FSMContext):
     await show_routes(c.message, state); await c.answer()
 
-# --- 4. Блок: ДНІ НАРОДЖЕННЯ ---
+# --- 4. ДНІ НАРОДЖЕННЯ ---
 @dp.message(F.text == "🎂 Дні народження")
 async def bday_menu(m: types.Message, state: FSMContext):
     await state.clear()
@@ -213,7 +254,7 @@ async def e_del_do(c: types.CallbackQuery):
     cur.execute("DELETE FROM employees WHERE id = %s", (eid,)); conn.commit(); cur.close(); conn.close()
     await c.answer("Видалено!"); await e_list(c)
 
-# --- 5. ЗМІНА ТА НАГАДУВАННЯ ---
+# --- 5. ЗМІНА ТА СИСТЕМНІ НАГАДУВАННЯ ---
 @dp.message(F.text == "⚙️ Зміна")
 async def change_shift(m: types.Message, state: FSMContext):
     await state.clear()
@@ -227,17 +268,67 @@ async def set_shift(c: types.CallbackQuery):
     cur.execute("UPDATE users SET shift_type = %s WHERE user_id = %s", (s, c.from_user.id)); conn.commit(); cur.close(); conn.close()
     await c.message.answer(f"✅ Встановлено графік: {s.upper()}"); await c.answer()
 
-async def check_reminders():
+# --- ГОЛОВНА ФУНКЦІЯ ПЕРЕВІРКИ (ЩОХВИЛИНИ) ---
+async def global_check():
     now = datetime.now(KYIV_TZ)
-    if now.weekday() > 4: return
     t = now.strftime("%H:%M")
-    try:
-        conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
-        cur.execute("SELECT user_id, shift_type FROM users"); rows = cur.fetchall(); cur.close(); conn.close()
-        for uid, s in rows:
-            if (s == 'day' and t == "07:43") or (s == 'night' and t == "16:43"):
-                await bot.send_message(uid, "🔔 Нагадування: Подайте кількість персоналу!")
-    except Exception as e: logging.error(f"Err: {e}")
+    
+    conn = psycopg2.connect(DATABASE_URL); cur = conn.cursor()
+    cur.execute("SELECT user_id, shift_type FROM users")
+    users = cur.fetchall()
+    
+    # 1. ПЕРЕВІРКА ДНІВ НАРОДЖЕННЯ (Щодня о 09:00)
+    if t == "09:00":
+        cur.execute("SELECT full_name FROM employees WHERE EXTRACT(MONTH FROM birth_date) = %s AND EXTRACT(DAY FROM birth_date) = %s", (now.month, now.day))
+        bdays = cur.fetchall()
+        if bdays:
+            names = "\n".join([f"🎉 {b[0]}" for b in bdays])
+            msg = f"🎂 **Сьогодні святкують:**\n\n{names}\n\nНе забудьте привітати!"
+            for uid, _ in users:
+                try: await bot.send_message(uid, msg, parse_mode="Markdown")
+                except: pass
+
+    # 2. ФІКСОВАНІ НАГАДУВАННЯ (ЛІЧИЛЬНИКИ - ЗАВЖДИ)
+    # Нічна зміна: 02:45, Денна зміна: 16:40
+    for uid, s in users:
+        msg = None
+        if s == 'night' and t == "02:45":
+            msg = "⚡ **Нагадування:** Зафіксувати лічильники!"
+        elif s == 'day' and t == "16:40":
+            msg = "⚡ **Нагадування:** Зафіксувати лічильники!"
+        
+        # Подача персоналу (Тільки будні: Пн-Пт)
+        if now.weekday() <= 4:
+            if s == 'day' and t == "07:43":
+                msg = "🔔 **Нагадування:** Подайте кількість персоналу!"
+            elif s == 'night' and t == "16:43":
+                msg = "🔔 **Нагадування:** Подайте кількість персоналу!"
+        
+        if msg:
+            try: await bot.send_message(uid, msg, parse_mode="Markdown")
+            except: pass
+
+    # 3. НАГАДУВАННЯ ПРО ЗАВДАННЯ (NAGGING MODE)
+    # Шукаємо невиконані завдання, де час нагадування вже настав або минув
+    cur.execute("SELECT id, title FROM tasks WHERE is_done = FALSE AND remind_at IS NOT NULL AND remind_at <= %s", (now,))
+    due_tasks = cur.fetchall()
+    
+    for tid, title in due_tasks:
+        # Відправляємо нагадування всім користувачам (або можна логіку прив'язки до автора, але тут для всіх)
+        for uid, _ in users:
+            try:
+                kb = InlineKeyboardBuilder()
+                kb.button(text="✅ Виконано", callback_data=f"tgl_{tid}")
+                kb.adjust(1)
+                await bot.send_message(uid, f"⏰ **НАГАДУВАННЯ:**\nНевиконане завдання: {title}", reply_markup=kb.as_markup(), parse_mode="Markdown")
+            except: pass
+        
+        # Переносимо нагадування на 1 годину вперед (щоб нагадати знову, якщо не виконають)
+        next_remind = now + timedelta(hours=1)
+        cur.execute("UPDATE tasks SET remind_at = %s WHERE id = %s", (next_remind, tid))
+        conn.commit()
+
+    cur.close(); conn.close()
 
 # --- 6. ЗАГАЛЬНИЙ ОБРОБНИК ---
 @dp.message()
@@ -249,14 +340,15 @@ async def main():
     init_db()
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(1)
-    scheduler.add_job(check_reminders, "interval", minutes=1); scheduler.start()
     
-    # Сервер для Render
+    scheduler.add_job(global_check, "interval", minutes=1)
+    scheduler.start()
+    
     app = web.Application(); app.router.add_get("/", lambda r: web.Response(text="OK"))
     runner = web.AppRunner(app); await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', 10000).start()
     
-    logging.info("ASTRO BOT STARTED")
+    logging.info("ASTRO BOT STARTED WITH REMINDERS")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
