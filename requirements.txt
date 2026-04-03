@@ -3,4 +3,3 @@ psycopg2-binary
 aiohttp
 apscheduler
 pytz
-Pillow
