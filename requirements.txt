@@ -4,4 +4,3 @@ aiohttp
 apscheduler
 pytz
 Pillow
-google-generativeai
