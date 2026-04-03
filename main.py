@@ -7,6 +7,8 @@ import json
 import base64
 import aiohttp
 import re
+import signal
+import sys
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -18,16 +20,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from PIL import Image
 from io import BytesIO
 
-# Правильний імпорт для Google Gemini
-try:
-    import google.generativeai as genai
-    logging.info("✅ Google GenerativeAI імпортовано успішно")
-except ImportError:
-    logging.error("❌ Помилка імпорту google.generativeai")
-    genai = None
-
 # --- НАЛАШТУВАННЯ ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -42,17 +37,10 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone=KYIV_TZ)
 
-# Ініціалізація Gemini Client
-if genai:
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        gemini_model = genai.GenerativeModel('gemini-1.5-flash')  # Використовуємо стабільну версію
-        logging.info("✅ Gemini Client успішно ініціалізовано")
-    except Exception as e:
-        logging.error(f"❌ Помилка ініціалізації Gemini Client: {e}")
-        gemini_model = None
-else:
-    gemini_model = None
+# Глобальні змінні для graceful shutdown
+shutdown_event = asyncio.Event()
+web_app = None
+web_runner = None
 
 MANAGERS_NAMES = [
     "Костюк Леся", "Склярук Анатолій", "Квартюк Іван", "Коваль Мирослава", "Селіверстов Олег",
@@ -137,29 +125,33 @@ sms_client = SMSFlyClient(SMS_FLY_API_KEY, SMS_FLY_SENDER)
 
 # --- БАЗА ДАНИХ ---
 def init_db():
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, username TEXT, shift_type TEXT DEFAULT 'day');")
-    cur.execute("CREATE TABLE IF NOT EXISTS employees (id SERIAL PRIMARY KEY, full_name TEXT, birth_date DATE);")
-    cur.execute("CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, title TEXT, is_done BOOLEAN DEFAULT FALSE);")
-    cur.execute("CREATE TABLE IF NOT EXISTS routes (id SERIAL PRIMARY KEY, info TEXT);")
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS employee_phones (
-            id SERIAL PRIMARY KEY,
-            full_name TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_employee_phones_name ON employee_phones(full_name);")
     try:
-        cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS remind_at TIMESTAMP;")
-    except:
-        conn.rollback()
-    conn.commit()
-    cur.close()
-    conn.close()
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, username TEXT, shift_type TEXT DEFAULT 'day');")
+        cur.execute("CREATE TABLE IF NOT EXISTS employees (id SERIAL PRIMARY KEY, full_name TEXT, birth_date DATE);")
+        cur.execute("CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, title TEXT, is_done BOOLEAN DEFAULT FALSE);")
+        cur.execute("CREATE TABLE IF NOT EXISTS routes (id SERIAL PRIMARY KEY, info TEXT);")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS employee_phones (
+                id SERIAL PRIMARY KEY,
+                full_name TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_employee_phones_name ON employee_phones(full_name);")
+        try:
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS remind_at TIMESTAMP;")
+        except:
+            conn.rollback()
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("✅ База даних ініціалізована")
+    except Exception as e:
+        logger.error(f"❌ Помилка ініціалізації БД: {e}")
 
 def get_employee_phone(full_name):
     try:
@@ -171,15 +163,12 @@ def get_employee_phone(full_name):
         cur.close()
         conn.close()
         return result[0] if result else None
-    except:
+    except Exception as e:
+        logger.error(f"Помилка отримання телефону: {e}")
         return None
 
 # --- ФУНКЦІЯ АНАЛІЗУ ТАБЛИЦЬ ЧЕРЕЗ GEMINI ---
 async def analyze_table_with_gemini(image_bytes, table_type="medical"):
-    if not gemini_model:
-        logging.error("Gemini model не ініціалізовано")
-        return None
-    
     try:
         # Оптимізація зображення
         img = Image.open(BytesIO(image_bytes))
@@ -215,9 +204,6 @@ async def analyze_table_with_gemini(image_bytes, table_type="medical"):
             
             ФОРМАТ ВІДПОВІДІ:
             [{"name": "Прізвище", "medical": "так/ні", "fluorography": "так/ні", "gynecology": "так/ні", "vaccination": "так/ні"}]
-            
-            ПРИКЛАД:
-            [{"name": "Костюк", "medical": "так", "fluorography": "ні", "gynecology": "ні", "vaccination": "так"}]
             """
         else:
             prompt = """
@@ -237,12 +223,9 @@ async def analyze_table_with_gemini(image_bytes, table_type="medical"):
             
             ФОРМАТ ВІДПОВІДІ:
             [{"name": "Прізвище", "need_to_work": "так/ні"}]
-            
-            ПРИКЛАД:
-            [{"name": "Костюк", "need_to_work": "так"}, {"name": "Склярук", "need_to_work": "ні"}]
             """
         
-        # Викликаємо Gemini через REST API (більш стабільно)
+        # Викликаємо Gemini через REST API
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
         
         payload = {
@@ -270,7 +253,6 @@ async def analyze_table_with_gemini(image_bytes, table_type="medical"):
                     data = await resp.json()
                     if 'candidates' in data and len(data['candidates']) > 0:
                         result_text = data['candidates'][0]['content']['parts'][0]['text']
-                        logging.info(f"Gemini відповів: {result_text[:200]}")
                         
                         # Очищаємо відповідь
                         result_text = result_text.strip()
@@ -284,15 +266,12 @@ async def analyze_table_with_gemini(image_bytes, table_type="medical"):
                         result = json.loads(result_text.strip())
                         return result
                     else:
-                        logging.error(f"Немає candidates у відповіді: {data}")
                         return None
                 else:
-                    error_text = await resp.text()
-                    logging.error(f"Gemini API помилка {resp.status}: {error_text}")
                     return None
                 
     except Exception as e:
-        logging.error(f"Помилка аналізу: {e}")
+        logger.error(f"Помилка аналізу: {e}")
         return None
 
 # --- ГОЛОВНЕ МЕНЮ ---
@@ -598,10 +577,6 @@ async def check_sms_balance(message: types.Message):
 # --- 7. МЕДПУНКТ ---
 @dp.message(F.text == "🏥 Медпункт")
 async def medical_start(message: types.Message, state: FSMContext):
-    if not gemini_model:
-        await message.answer("❌ **Gemini API не налаштовано!** Зверніться до адміністратора.", parse_mode="Markdown")
-        return
-    
     await message.answer(
         "🏥 **Медичний огляд працівників**\n\n"
         "📸 **Сфотографуйте таблицю** з графіком медоглядів.\n\n"
@@ -617,7 +592,7 @@ async def medical_start(message: types.Message, state: FSMContext):
 
 @dp.message(BotStates.waiting_for_medical_photo, F.photo)
 async def process_medical_photo(message: types.Message, state: FSMContext, bot: Bot):
-    wait_msg = await message.answer("🔍 **Аналізую таблицю за допомогою Gemini...**\n(це займе 3-5 секунд)", parse_mode="Markdown")
+    wait_msg = await message.answer("🔍 **Аналізую таблицю...**\n(це займе 3-5 секунд)", parse_mode="Markdown")
     
     try:
         photo = message.photo[-1]
@@ -674,7 +649,7 @@ async def process_medical_photo(message: types.Message, state: FSMContext, bot: 
         )
         
     except Exception as e:
-        logging.error(f"Medical error: {e}")
+        logger.error(f"Medical error: {e}")
         await wait_msg.edit_text(f"❌ **Помилка обробки фото:** {str(e)[:100]}", parse_mode="Markdown")
         await state.clear()
 
@@ -745,10 +720,6 @@ async def cancel_medical(callback: types.CallbackQuery, state: FSMContext):
 # --- 8. РОБОТА В НЕДІЛЮ ---
 @dp.message(F.text == "📅 Робота в неділю")
 async def sunday_start(message: types.Message, state: FSMContext):
-    if not gemini_model:
-        await message.answer("❌ **Gemini API не налаштовано!** Зверніться до адміністратора.", parse_mode="Markdown")
-        return
-    
     await message.answer(
         "📅 **Графік роботи в неділю**\n\n"
         "📸 **Сфотографуйте таблицю** з графіком роботи.\n\n"
@@ -760,7 +731,7 @@ async def sunday_start(message: types.Message, state: FSMContext):
 
 @dp.message(BotStates.waiting_for_sunday_photo, F.photo)
 async def process_sunday_photo(message: types.Message, state: FSMContext, bot: Bot):
-    wait_msg = await message.answer("🔍 **Аналізую таблицю за допомогою Gemini...**\n(це займе 3-5 секунд)", parse_mode="Markdown")
+    wait_msg = await message.answer("🔍 **Аналізую таблицю...**\n(це займе 3-5 секунд)", parse_mode="Markdown")
     
     try:
         photo = message.photo[-1]
@@ -803,7 +774,7 @@ async def process_sunday_photo(message: types.Message, state: FSMContext, bot: B
         )
         
     except Exception as e:
-        logging.error(f"Sunday error: {e}")
+        logger.error(f"Sunday error: {e}")
         await wait_msg.edit_text(f"❌ **Помилка обробки фото:** {str(e)[:100]}", parse_mode="Markdown")
         await state.clear()
 
@@ -860,72 +831,115 @@ async def cancel_sunday(callback: types.CallbackQuery, state: FSMContext):
 
 # --- 9. НАГАДУВАННЯ ---
 async def global_check():
-    now = datetime.now(KYIV_TZ)
-    t = now.strftime("%H:%M")
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, shift_type FROM users")
-    users = cur.fetchall()
-    
-    if t == "09:00":
-        cur.execute("SELECT full_name FROM employees WHERE EXTRACT(MONTH FROM birth_date) = %s AND EXTRACT(DAY FROM birth_date) = %s", (now.month, now.day))
-        bdays = cur.fetchall()
-        if bdays:
-            names = "\n".join([f"🎉 {b[0]}" for b in bdays])
-            msg = f"🎂 **Сьогодні святкують:**\n\n{names}\n\nНе забудьте привітати!"
-            for uid, _ in users:
+    try:
+        now = datetime.now(KYIV_TZ)
+        t = now.strftime("%H:%M")
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, shift_type FROM users")
+        users = cur.fetchall()
+        
+        if t == "09:00":
+            cur.execute("SELECT full_name FROM employees WHERE EXTRACT(MONTH FROM birth_date) = %s AND EXTRACT(DAY FROM birth_date) = %s", (now.month, now.day))
+            bdays = cur.fetchall()
+            if bdays:
+                names = "\n".join([f"🎉 {b[0]}" for b in bdays])
+                msg = f"🎂 **Сьогодні святкують:**\n\n{names}\n\nНе забудьте привітати!"
+                for uid, _ in users:
+                    try: await bot.send_message(uid, msg, parse_mode="Markdown")
+                    except: pass
+        
+        for uid, s in users:
+            msg = None
+            if s == 'night' and t == "02:45":
+                msg = "⚡ **Нагадування:** Зафіксувати лічильники!"
+            elif s == 'day' and t == "16:40":
+                msg = "⚡ **Нагадування:** Зафіксувати лічильники!"
+            if now.weekday() <= 4:
+                if s == 'day' and t == "07:43":
+                    msg = "🔔 **Нагадування:** Подайте кількість персоналу!"
+                elif s == 'night' and t == "16:43":
+                    msg = "🔔 **Нагадування:** Подайте кількість персоналу!"
+            if msg:
                 try: await bot.send_message(uid, msg, parse_mode="Markdown")
                 except: pass
-    
-    for uid, s in users:
-        msg = None
-        if s == 'night' and t == "02:45":
-            msg = "⚡ **Нагадування:** Зафіксувати лічильники!"
-        elif s == 'day' and t == "16:40":
-            msg = "⚡ **Нагадування:** Зафіксувати лічильники!"
-        if now.weekday() <= 4:
-            if s == 'day' and t == "07:43":
-                msg = "🔔 **Нагадування:** Подайте кількість персоналу!"
-            elif s == 'night' and t == "16:43":
-                msg = "🔔 **Нагадування:** Подайте кількість персоналу!"
-        if msg:
-            try: await bot.send_message(uid, msg, parse_mode="Markdown")
-            except: pass
-    
-    cur.execute("SELECT id, title FROM tasks WHERE is_done = FALSE AND remind_at IS NOT NULL AND remind_at <= %s", (now,))
-    due_tasks = cur.fetchall()
-    for tid, title in due_tasks:
-        for uid, _ in users:
-            try:
-                kb = InlineKeyboardBuilder()
-                kb.button(text="✅ Виконано", callback_data=f"tgl_{tid}")
-                await bot.send_message(uid, f"⏰ **НАГАДУВАННЯ:**\n{title}", reply_markup=kb.as_markup(), parse_mode="Markdown")
-            except: pass
-        next_remind = now + timedelta(hours=1)
-        cur.execute("UPDATE tasks SET remind_at = %s WHERE id = %s", (next_remind, tid))
-        conn.commit()
-    cur.close()
-    conn.close()
+        
+        cur.execute("SELECT id, title FROM tasks WHERE is_done = FALSE AND remind_at IS NOT NULL AND remind_at <= %s", (now,))
+        due_tasks = cur.fetchall()
+        for tid, title in due_tasks:
+            for uid, _ in users:
+                try:
+                    kb = InlineKeyboardBuilder()
+                    kb.button(text="✅ Виконано", callback_data=f"tgl_{tid}")
+                    await bot.send_message(uid, f"⏰ **НАГАДУВАННЯ:**\n{title}", reply_markup=kb.as_markup(), parse_mode="Markdown")
+                except: pass
+            next_remind = now + timedelta(hours=1)
+            cur.execute("UPDATE tasks SET remind_at = %s WHERE id = %s", (next_remind, tid))
+            conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Global check error: {e}")
 
 # --- 10. ЗАГАЛЬНИЙ ОБРОБНИК ---
 @dp.message()
 async def any_msg(m: types.Message):
     await m.answer("Будь ласка, використовуйте меню 👇", reply_markup=main_menu())
 
+# --- GRACEFUL SHUTDOWN ---
+async def shutdown():
+    logger.info("Отримано сигнал завершення...")
+    shutdown_event.set()
+    
+    # Зупиняємо планувальник
+    scheduler.shutdown(wait=False)
+    
+    # Зупиняємо веб-сервер
+    if web_runner:
+        await web_runner.cleanup()
+    
+    # Закриваємо сесію бота
+    await bot.session.close()
+    
+    logger.info("Бот зупинено")
+    sys.exit(0)
+
+def signal_handler():
+    asyncio.create_task(shutdown())
+
 # --- ЗАПУСК ---
 async def main():
+    global web_runner
+    
     init_db()
+    
+    # Налаштовуємо обробку сигналів
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda s, f: asyncio.create_task(shutdown()))
+    
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(1)
+    
     scheduler.add_job(global_check, "interval", minutes=1)
     scheduler.start()
+    
+    # Веб-сервер для health check
     app = web.Application()
     app.router.add_get("/", lambda r: web.Response(text="OK"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, '0.0.0.0', 10000).start()
-    logging.info("🚀 Бот успішно запущено з Gemini!")
-    await dp.start_polling(bot)
+    web_runner = web.AppRunner(app)
+    await web_runner.setup()
+    site = web.TCPSite(web_runner, '0.0.0.0', 10000)
+    await site.start()
+    
+    logger.info("🚀 Бот успішно запущено!")
+    
+    # Запускаємо polling
+    try:
+        await dp.start_polling(bot)
+    except asyncio.CancelledError:
+        logger.info("Polling cancelled")
+    finally:
+        await shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
