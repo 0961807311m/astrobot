@@ -167,10 +167,10 @@ def get_employee_phone(full_name):
         logger.error(f"Помилка отримання телефону: {e}")
         return None
 
-# --- ФУНКЦІЯ АНАЛІЗУ ТАБЛИЦЬ ЧЕРЕЗ GEMINI ---
+# --- ФУНКЦІЯ АНАЛІЗУ ТАБЛИЦЬ ЧЕРЕЗ GEMINI 2.0 FLASH ---
 async def analyze_table_with_gemini(image_bytes, table_type="medical"):
     """
-    Аналіз таблиці через Gemini з покращеним розпізнаванням для вашої таблиці
+    Аналіз таблиці через Gemini 2.0 Flash з покращеним розпізнаванням для вашої таблиці
     """
     try:
         # Покращена оптимізація зображення
@@ -252,8 +252,8 @@ async def analyze_table_with_gemini(image_bytes, table_type="medical"):
             НЕ ДОДАВАЙ ЖОДНОГО ТЕКСТУ КРІМ JSON!
             """
         
-        # Викликаємо Gemini API
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        # ВИКОРИСТОВУЄМО ПРАВИЛЬНУ МОДЕЛЬ gemini-2.0-flash
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
         
         payload = {
             "contents": [{
@@ -971,7 +971,7 @@ async def main():
     site = web.TCPSite(web_runner, '0.0.0.0', 10000)
     await site.start()
     
-    logger.info("🚀 Бот успішно запущено!")
+    logger.info("🚀 Бот успішно запущено з Gemini 2.0 Flash!")
     
     try:
         await dp.start_polling(bot)
