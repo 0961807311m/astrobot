@@ -28,8 +28,8 @@ TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 KYIV_TZ = pytz.timezone("Europe/Kyiv")
 
-# API ключі - ВИКОРИСТОВУЄМО ВАШ РОБОЧИЙ КЛЮЧ ДЛЯ GEMINI 2.5 FLASH
-GEMINI_API_KEY = "AIzaSyDHwSkhc3XpXT3IjNrF1CnOheTYaUvn7Xc"
+# API ключі - НОВИЙ КЛЮЧ
+GEMINI_API_KEY = "AIzaSyDF02DF1mWlzY9LbykDp5SL9fsJhNd9Hxo"
 SMS_FLY_API_KEY = os.getenv("SMS_FLY_API_KEY", "t1G7njJlTFjmCJRs7HV96ZLG2gmND9O5")
 SMS_FLY_SENDER = os.getenv("SMS_FLY_SENDER", "YourBot")
 
@@ -167,8 +167,7 @@ def get_employee_phone(full_name):
         return None
 
 # --- ФУНКЦІЯ СТИСНЕННЯ ЗОБРАЖЕННЯ ---
-async def compress_image(image_bytes, max_size=1024, quality=75):
-    """Стиснення зображення для економії токенів"""
+async def compress_image(image_bytes, max_size=1024, quality=70):
     try:
         img = Image.open(BytesIO(image_bytes))
         
@@ -180,7 +179,6 @@ async def compress_image(image_bytes, max_size=1024, quality=75):
             new_size = (int(img.width * ratio), int(img.height * ratio))
             img = img.resize(new_size, Image.Resampling.LANCZOS)
         
-        # Підвищуємо контраст для кращого розпізнавання
         enhancer = ImageEnhance.Contrast(img)
         img = enhancer.enhance(1.3)
         
@@ -200,59 +198,37 @@ async def compress_image(image_bytes, max_size=1024, quality=75):
 
 # --- ФУНКЦІЯ АНАЛІЗУ ТАБЛИЦЬ ЧЕРЕЗ GEMINI 2.5 FLASH ---
 async def analyze_table_with_gemini(image_bytes, table_type="medical"):
-    """
-    Аналіз таблиці через Gemini 2.5 Flash (як у проекті з етикетками)
-    """
-    # Стискаємо зображення
-    compressed_image = await compress_image(image_bytes, max_size=1024, quality=75)
+    compressed_image = await compress_image(image_bytes, max_size=1024, quality=70)
     image_base64 = base64.b64encode(compressed_image).decode('utf-8')
     
-    # ПРОМПТ ЯК У ПРОЕКТІ З ЕТИКЕТКАМИ (адаптований для таблиць)
     if table_type == "medical":
         prompt = """
-        Ти — експерт з розпізнавання таблиць медичних оглядів.
-        
-        На фото таблиця з графіком проходження медоглядів працівниками.
-        
-        ТВОЄ ЗАВДАННЯ:
-        Розпізнати прізвища працівників та позначки про необхідні огляди.
-        
-        ВАЖЛИВІ ІНСТРУКЦІЇ:
-        1. Прізвища зазвичай в першій колонці (стовпчик "Прізвище, ім'я та по батькові")
-        2. З повного ПІБ візьми ТІЛЬКИ ПРІЗВИЩЕ (перше слово)
-        3. Позначки можуть бути: ✓, +, Х, "потрібно", "так", "ні"
-        4. М - медогляд, Ф - флюрографія, Г - гінеколог, В - щеплення
-        5. Якщо в клітинці є "потрібно" або будь-яка позначка - став "так"
-        6. Якщо пусто або "ні" - став "ні"
-        7. Для гінеколога - якщо прізвище чоловіче, завжди "ні"
-        8. Відповідай ТІЛЬКИ у форматі JSON масивом
-        
-        ФОРМАТ ВІДПОВІДІ:
-        [{"name": "Прізвище", "medical": "так/ні", "fluorography": "так/ні", "gynecology": "так/ні", "vaccination": "так/ні"}]
-        
-        ПРИКЛАД:
-        [{"name": "Костюк", "medical": "так", "fluorography": "ні", "gynecology": "ні", "vaccination": "так"}]
-        """
+Ти — експерт з розпізнавання таблиць медичних оглядів.
+
+На фото таблиця з графіком проходження медоглядів.
+
+ТВОЄ ЗАВДАННЯ:
+Розпізнати прізвища працівників та позначки.
+
+ВАЖЛИВІ ІНСТРУКЦІЇ:
+1. З повного ПІБ візьми ТІЛЬКИ ПРІЗВИЩЕ (перше слово)
+2. Позначки "потрібно" або "так" = "так"
+3. Позначки "ні" або пусто = "ні"
+4. Для гінеколога - тільки жіночі прізвища
+
+ВІДПОВІДАЙ ТІЛЬКИ JSON масивом:
+[{"name": "Прізвище", "medical": "так/ні", "fluorography": "так/ні", "gynecology": "так/ні", "vaccination": "так/ні"}]
+"""
     else:
         prompt = """
-        Ти — експерт з розпізнавання таблиць графіків роботи.
-        
-        На фото таблиця з графіком роботи працівників в неділю.
-        
-        ТВОЄ ЗАВДАННЯ:
-        Розпізнати прізвища працівників, які позначені як ті, хто працює в неділю.
-        
-        ВАЖЛИВІ ІНСТРУКЦІЇ:
-        1. Прізвища зазвичай в першій колонці
-        2. Позначки можуть бути: ✓, +, Х, "так", "працює"
-        3. Якщо є позначка - став "так", якщо пусто - "ні"
-        4. Відповідай ТІЛЬКИ у форматі JSON масивом
-        
-        ФОРМАТ ВІДПОВІДІ:
-        [{"name": "Прізвище", "need_to_work": "так/ні"}]
-        """
+Ти — експерт з розпізнавання таблиць графіків роботи.
+
+На фото таблиця з графіком роботи в неділю.
+
+ВІДПОВІДАЙ ТІЛЬКИ JSON:
+[{"name": "Прізвище", "need_to_work": "так/ні"}]
+"""
     
-    # ВИКОРИСТОВУЄМО GEMINI 2.5 FLASH (як у вашому проекті)
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     
     payload = {
@@ -264,66 +240,44 @@ async def analyze_table_with_gemini(image_bytes, table_type="medical"):
         }],
         "generationConfig": {
             "temperature": 0.1,
-            "topK": 1,
-            "topP": 0.8,
-            "maxOutputTokens": 2048
+            "maxOutputTokens": 1024
         }
     }
     
-    max_retries = 3
-    retry_delay = 3
-    
-    for attempt in range(max_retries):
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=90) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if 'candidates' in data and len(data['candidates']) > 0:
-                            result_text = data['candidates'][0]['content']['parts'][0]['text']
-                            logger.info(f"Gemini 2.5 Flash відповів: {result_text[:200]}")
-                            
-                            # Очищаємо відповідь
-                            result_text = result_text.strip()
-                            if result_text.startswith('```json'):
-                                result_text = result_text[7:]
-                            if result_text.startswith('```'):
-                                result_text = result_text[3:]
-                            if result_text.endswith('```'):
-                                result_text = result_text[:-3]
-                            
-                            # Шукаємо JSON масив
-                            json_match = re.search(r'\[.*\]', result_text, re.DOTALL)
-                            if json_match:
-                                result_text = json_match.group()
-                            
-                            result = json.loads(result_text)
-                            logger.info(f"Розпізнано {len(result)} працівників")
-                            return result
-                        else:
-                            logger.error(f"No candidates in response: {data}")
-                            return None
-                    elif resp.status == 429:
-                        logger.warning(f"Rate limit (спроба {attempt + 1}/{max_retries})")
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(retry_delay)
-                            continue
-                        else:
-                            return None
-                    else:
-                        error_text = await resp.text()
-                        logger.error(f"Gemini API error {resp.status}: {error_text}")
-                        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=90) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if 'candidates' in data and len(data['candidates']) > 0:
+                        result_text = data['candidates'][0]['content']['parts'][0]['text']
+                        logger.info(f"Gemini відповів: {result_text[:200]}")
                         
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON decode error: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Analysis error: {e}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(retry_delay)
-                continue
-            return None
+                        result_text = result_text.strip()
+                        if result_text.startswith('```json'):
+                            result_text = result_text[7:]
+                        if result_text.startswith('```'):
+                            result_text = result_text[3:]
+                        if result_text.endswith('```'):
+                            result_text = result_text[:-3]
+                        
+                        json_match = re.search(r'\[.*\]', result_text, re.DOTALL)
+                        if json_match:
+                            result_text = json_match.group()
+                        
+                        result = json.loads(result_text)
+                        logger.info(f"Розпізнано {len(result)} працівників")
+                        return result
+                elif resp.status == 403:
+                    logger.error("API ключ заблоковано! Отримайте новий ключ")
+                    return None
+                else:
+                    error_text = await resp.text()
+                    logger.error(f"Gemini API error {resp.status}: {error_text}")
+                    return None
+    except Exception as e:
+        logger.error(f"Analysis error: {e}")
+        return None
     
     return None
 
@@ -633,13 +587,7 @@ async def medical_start(message: types.Message, state: FSMContext):
     await message.answer(
         "🏥 **Медичний огляд працівників**\n\n"
         "📸 **Сфотографуйте таблицю** з графіком медоглядів.\n\n"
-        "Таблиця повинна містити колонки:\n"
-        "• Прізвище, ім'я та по батькові\n"
-        "• Медогляд\n"
-        "• Флюорографія\n"
-        "• Гінеколог\n"
-        "• Вакцинація\n\n"
-        "⚡ *Використовується Gemini 2.5 Flash для точного розпізнавання*\n"
+        "⚡ *Використовується Gemini 2.5 Flash*\n"
         "💡 *Фотографуйте чітко, при хорошому освітленні*",
         parse_mode="Markdown"
     )
@@ -659,14 +607,7 @@ async def process_medical_photo(message: types.Message, state: FSMContext, bot: 
         if not employees:
             await wait_msg.edit_text(
                 "❌ **Не вдалося розпізнати таблицю.**\n\n"
-                "📌 **Можливі причини:**\n"
-                "• Погане освітлення\n"
-                "• Розмите фото\n"
-                "• Нестандартний формат таблиці\n\n"
-                "💡 **Поради:**\n"
-                "• Сфотографуйте при денному світлі\n"
-                "• Тримайте камеру рівно\n"
-                "• Переконайтеся, що текст чіткий",
+                "💡 Спробуйте сфотографувати ще раз, тримаючи камеру рівно.",
                 parse_mode="Markdown"
             )
             await state.clear()
@@ -785,7 +726,6 @@ async def sunday_start(message: types.Message, state: FSMContext):
     await message.answer(
         "📅 **Графік роботи в неділю**\n\n"
         "📸 **Сфотографуйте таблицю** з графіком роботи.\n\n"
-        "Я розпізнаю працівників, які працюють в неділю.\n\n"
         "⚡ *Використовується Gemini 2.5 Flash*\n"
         "💡 *Фотографуйте чітко, при хорошому освітленні*",
         parse_mode="Markdown"
@@ -972,8 +912,9 @@ async def main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda s, f: asyncio.create_task(shutdown()))
     
+    # ВАЖЛИВО: Зупиняємо webhook перед запуском polling
     await bot.delete_webhook(drop_pending_updates=True)
-    await asyncio.sleep(1)
+    await asyncio.sleep(2)  # Пауза для завершення інших з'єднань
     
     scheduler.add_job(global_check, "interval", minutes=1)
     scheduler.start()
