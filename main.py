@@ -15,11 +15,16 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from google import genai
-from google.genai.types import Part
-from google.genai.errors import APIError as GeminiAPIError
 from PIL import Image
 from io import BytesIO
+
+# Правильний імпорт для Google Gemini
+try:
+    import google.generativeai as genai
+    logging.info("✅ Google GenerativeAI імпортовано успішно")
+except ImportError:
+    logging.error("❌ Помилка імпорту google.generativeai")
+    genai = None
 
 # --- НАЛАШТУВАННЯ ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -38,12 +43,16 @@ dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone=KYIV_TZ)
 
 # Ініціалізація Gemini Client
-try:
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    logging.info("✅ Gemini Client (2.5 Flash) успішно ініціалізовано")
-except Exception as e:
-    logging.error(f"❌ Помилка ініціалізації Gemini Client: {e}")
-    gemini_client = None
+if genai:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        gemini_model = genai.GenerativeModel('gemini-1.5-flash')  # Використовуємо стабільну версію
+        logging.info("✅ Gemini Client успішно ініціалізовано")
+    except Exception as e:
+        logging.error(f"❌ Помилка ініціалізації Gemini Client: {e}")
+        gemini_model = None
+else:
+    gemini_model = None
 
 MANAGERS_NAMES = [
     "Костюк Леся", "Склярук Анатолій", "Квартюк Іван", "Коваль Мирослава", "Селіверстов Олег",
@@ -165,13 +174,14 @@ def get_employee_phone(full_name):
     except:
         return None
 
-# --- ФУНКЦІЯ АНАЛІЗУ ТАБЛИЦЬ ЧЕРЕЗ GEMINI 2.5 FLASH ---
+# --- ФУНКЦІЯ АНАЛІЗУ ТАБЛИЦЬ ЧЕРЕЗ GEMINI ---
 async def analyze_table_with_gemini(image_bytes, table_type="medical"):
-    if not gemini_client:
-        logging.error("Gemini client не ініціалізовано")
+    if not gemini_model:
+        logging.error("Gemini model не ініціалізовано")
         return None
     
     try:
+        # Оптимізація зображення
         img = Image.open(BytesIO(image_bytes))
         max_size = 1024
         if img.width > max_size or img.height > max_size:
@@ -183,7 +193,8 @@ async def analyze_table_with_gemini(image_bytes, table_type="medical"):
         img.save(buffer, format='JPEG', quality=85, optimize=True)
         optimized_bytes = buffer.getvalue()
         
-        image_part = Part.from_bytes(data=optimized_bytes, mime_type='image/jpeg')
+        # Конвертуємо в base64
+        image_base64 = base64.b64encode(optimized_bytes).decode('utf-8')
         
         if table_type == "medical":
             prompt = """
@@ -204,6 +215,9 @@ async def analyze_table_with_gemini(image_bytes, table_type="medical"):
             
             ФОРМАТ ВІДПОВІДІ:
             [{"name": "Прізвище", "medical": "так/ні", "fluorography": "так/ні", "gynecology": "так/ні", "vaccination": "так/ні"}]
+            
+            ПРИКЛАД:
+            [{"name": "Костюк", "medical": "так", "fluorography": "ні", "gynecology": "ні", "vaccination": "так"}]
             """
         else:
             prompt = """
@@ -223,32 +237,60 @@ async def analyze_table_with_gemini(image_bytes, table_type="medical"):
             
             ФОРМАТ ВІДПОВІДІ:
             [{"name": "Прізвище", "need_to_work": "так/ні"}]
+            
+            ПРИКЛАД:
+            [{"name": "Костюк", "need_to_work": "так"}, {"name": "Склярук", "need_to_work": "ні"}]
             """
         
-        response = gemini_client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[image_part, prompt]
-        )
+        # Викликаємо Gemini через REST API (більш стабільно)
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
         
-        result_text = response.text.strip()
-        logging.info(f"Gemini відповів: {result_text[:200]}")
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": image_base64
+                        }
+                    }
+                ]
+            }],
+            "generationConfig": {
+                "temperature": 0.1,
+                "topK": 1,
+                "topP": 0.8
+            }
+        }
         
-        if result_text.startswith('```json'):
-            result_text = result_text[7:]
-        if result_text.startswith('```'):
-            result_text = result_text[3:]
-        if result_text.endswith('```'):
-            result_text = result_text[:-3]
-        
-        data = json.loads(result_text.strip())
-        return data
-        
-    except GeminiAPIError as e:
-        logging.error(f"Gemini API помилка: {e}")
-        return None
-    except json.JSONDecodeError as e:
-        logging.error(f"JSON помилка: {e}")
-        return None
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=60) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if 'candidates' in data and len(data['candidates']) > 0:
+                        result_text = data['candidates'][0]['content']['parts'][0]['text']
+                        logging.info(f"Gemini відповів: {result_text[:200]}")
+                        
+                        # Очищаємо відповідь
+                        result_text = result_text.strip()
+                        if result_text.startswith('```json'):
+                            result_text = result_text[7:]
+                        if result_text.startswith('```'):
+                            result_text = result_text[3:]
+                        if result_text.endswith('```'):
+                            result_text = result_text[:-3]
+                        
+                        result = json.loads(result_text.strip())
+                        return result
+                    else:
+                        logging.error(f"Немає candidates у відповіді: {data}")
+                        return None
+                else:
+                    error_text = await resp.text()
+                    logging.error(f"Gemini API помилка {resp.status}: {error_text}")
+                    return None
+                
     except Exception as e:
         logging.error(f"Помилка аналізу: {e}")
         return None
@@ -556,7 +598,7 @@ async def check_sms_balance(message: types.Message):
 # --- 7. МЕДПУНКТ ---
 @dp.message(F.text == "🏥 Медпункт")
 async def medical_start(message: types.Message, state: FSMContext):
-    if not gemini_client:
+    if not gemini_model:
         await message.answer("❌ **Gemini API не налаштовано!** Зверніться до адміністратора.", parse_mode="Markdown")
         return
     
@@ -575,7 +617,7 @@ async def medical_start(message: types.Message, state: FSMContext):
 
 @dp.message(BotStates.waiting_for_medical_photo, F.photo)
 async def process_medical_photo(message: types.Message, state: FSMContext, bot: Bot):
-    wait_msg = await message.answer("🔍 **Аналізую таблицю за допомогою Gemini 2.5 Flash...**\n(це займе 3-5 секунд)", parse_mode="Markdown")
+    wait_msg = await message.answer("🔍 **Аналізую таблицю за допомогою Gemini...**\n(це займе 3-5 секунд)", parse_mode="Markdown")
     
     try:
         photo = message.photo[-1]
@@ -653,7 +695,6 @@ async def send_medical_sms(callback: types.CallbackQuery, state: FSMContext):
         phone = get_employee_phone(emp['name'])
         
         if phone:
-            # Збираємо короткі позначки
             needs_short = []
             if emp.get('medical') == 'так':
                 needs_short.append("М")
@@ -665,7 +706,6 @@ async def send_medical_sms(callback: types.CallbackQuery, state: FSMContext):
                 needs_short.append("Щ")
             
             if needs_short:
-                # КОРОТКЕ SMS повідомлення
                 msg = f"Потрібне медобстеження: {', '.join(needs_short)}"
                 result = await sms_client.send_sms(phone, msg)
                 results.append({"name": emp['name'], "success": result['success'], "phone": phone, "needs": needs_short})
@@ -682,7 +722,6 @@ async def send_medical_sms(callback: types.CallbackQuery, state: FSMContext):
     report += f"📭 Немає телефону: {no_phone_count}\n"
     report += f"❌ Помилок: {len(employees) - success_count - no_phone_count}\n\n"
     
-    # Додаємо деталі з короткими позначками
     if results:
         report += "**Деталі:**\n"
         for r in results:
@@ -706,7 +745,7 @@ async def cancel_medical(callback: types.CallbackQuery, state: FSMContext):
 # --- 8. РОБОТА В НЕДІЛЮ ---
 @dp.message(F.text == "📅 Робота в неділю")
 async def sunday_start(message: types.Message, state: FSMContext):
-    if not gemini_client:
+    if not gemini_model:
         await message.answer("❌ **Gemini API не налаштовано!** Зверніться до адміністратора.", parse_mode="Markdown")
         return
     
@@ -721,7 +760,7 @@ async def sunday_start(message: types.Message, state: FSMContext):
 
 @dp.message(BotStates.waiting_for_sunday_photo, F.photo)
 async def process_sunday_photo(message: types.Message, state: FSMContext, bot: Bot):
-    wait_msg = await message.answer("🔍 **Аналізую таблицю за допомогою Gemini 2.5 Flash...**\n(це займе 3-5 секунд)", parse_mode="Markdown")
+    wait_msg = await message.answer("🔍 **Аналізую таблицю за допомогою Gemini...**\n(це займе 3-5 секунд)", parse_mode="Markdown")
     
     try:
         photo = message.photo[-1]
@@ -785,7 +824,6 @@ async def send_sunday_sms(callback: types.CallbackQuery, state: FSMContext):
         phone = get_employee_phone(worker['name'])
         
         if phone:
-            # КОРОТКЕ SMS повідомлення для роботи в неділю
             msg = f"Вітаю! В неділю очікуємо на зміні."
             result = await sms_client.send_sms(phone, msg)
             results.append({"name": worker['name'], "success": result['success'], "phone": phone})
@@ -886,7 +924,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', 10000).start()
-    logging.info("🚀 Бот успішно запущено з Gemini 2.5 Flash!")
+    logging.info("🚀 Бот успішно запущено з Gemini!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
