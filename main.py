@@ -17,7 +17,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from PIL import Image
+from PIL import Image, ImageEnhance
 from io import BytesIO
 
 # --- НАЛАШТУВАННЯ ---
@@ -39,7 +39,6 @@ scheduler = AsyncIOScheduler(timezone=KYIV_TZ)
 
 # Глобальні змінні для graceful shutdown
 shutdown_event = asyncio.Event()
-web_app = None
 web_runner = None
 
 MANAGERS_NAMES = [
@@ -157,6 +156,7 @@ def get_employee_phone(full_name):
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
+        # Шукаємо за прізвищем (перше слово)
         short_name = full_name.split()[0] if ' ' in full_name else full_name
         cur.execute("SELECT phone FROM employee_phones WHERE full_name ILIKE %s LIMIT 1", (f"%{short_name}%",))
         result = cur.fetchone()
@@ -169,63 +169,90 @@ def get_employee_phone(full_name):
 
 # --- ФУНКЦІЯ АНАЛІЗУ ТАБЛИЦЬ ЧЕРЕЗ GEMINI ---
 async def analyze_table_with_gemini(image_bytes, table_type="medical"):
+    """
+    Аналіз таблиці через Gemini з покращеним розпізнаванням для вашої таблиці
+    """
     try:
-        # Оптимізація зображення
+        # Покращена оптимізація зображення
         img = Image.open(BytesIO(image_bytes))
-        max_size = 1024
-        if img.width > max_size or img.height > max_size:
-            img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        
+        # Конвертуємо в RGB
         if img.mode in ('RGBA', 'P'):
             img = img.convert('RGB')
         
+        # Збільшуємо контрастність для кращого розпізнавання
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(1.8)
+        
+        # Збільшуємо різкість
+        enhancer = ImageEnhance.Sharpness(img)
+        img = enhancer.enhance(1.5)
+        
+        # Змінюємо розмір для кращого розпізнавання
+        target_size = 1280
+        ratio = target_size / max(img.width, img.height)
+        if ratio < 1:
+            new_size = (int(img.width * ratio), int(img.height * ratio))
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
+        
+        # Зберігаємо з високою якістю
         buffer = BytesIO()
-        img.save(buffer, format='JPEG', quality=85, optimize=True)
+        img.save(buffer, format='JPEG', quality=95, optimize=True)
         optimized_bytes = buffer.getvalue()
         
         # Конвертуємо в base64
         image_base64 = base64.b64encode(optimized_bytes).decode('utf-8')
         
+        # ПРОМПТ ДЛЯ ВАШОЇ ТАБЛИЦІ
         if table_type == "medical":
             prompt = """
-            Ти — експерт з розпізнавання таблиць медичних оглядів.
+            Ти — експерт з розпізнавання текстів на фотографіях таблиць.
             
-            На фото таблиця з графіком проходження медоглядів працівниками.
+            На фото таблиця з графіком медичних оглядів працівників.
             
-            ТВОЄ ЗАВДАННЯ:
-            Розпізнати прізвища працівників та позначки про необхідні огляди.
+            Структура таблиці:
+            - Колонка 1: "Прізвище, ім'я та по батькові" (ПІБ працівника)
+            - Колонка 2: "Медогляд" (позначка "потрібно" або "ні")
+            - Колонка 3: "Флюорографія" (позначка "потрібно" або "ні")
+            - Колонка 4: "Гінеколог" (позначка "потрібно" або "ні")
+            - Колонка 5: "Вакцинація" (позначка "потрібно" або "ні")
             
-            ВАЖЛИВІ ІНСТРУКЦІЇ:
-            1. Прізвища зазвичай в першій колонці
-            2. Позначки можуть бути: ✓, +, Х, М, Ф, Г, В, "так", "ні"
-            3. М - медогляд, Ф - флюрографія, Г - гінеколог, В - щеплення
-            4. Якщо є позначка - став "так", якщо пусто - "ні"
-            5. Ігноруй шапку таблиці
-            6. Відповідай ТІЛЬКИ у форматі JSON масивом
+            ПРАВИЛА РОЗПІЗНАВАННЯ:
+            1. З колонки "Прізвище, ім'я та по батькові" візьми ТІЛЬКИ ПРІЗВИЩЕ (перше слово)
+            2. Якщо в колонці написано "потрібно" - став "так"
+            3. Якщо написано "ні" або пусто - став "ні"
+            4. Для гінеколога - перевіряй тільки жіночі прізвища (закінчуються на "а", "я")
+            5. Якщо прізвище чоловіче - гінеколог завжди "ні"
             
-            ФОРМАТ ВІДПОВІДІ:
-            [{"name": "Прізвище", "medical": "так/ні", "fluorography": "так/ні", "gynecology": "так/ні", "vaccination": "так/ні"}]
+            ВІДПОВІДАЙ ТІЛЬКИ У ФОРМАТІ JSON масивом:
+            [
+                {"name": "Прізвище", "medical": "так/ні", "fluorography": "так/ні", "gynecology": "так/ні", "vaccination": "так/ні"}
+            ]
+            
+            ПРИКЛАД ВІДПОВІДІ:
+            [
+                {"name": "Акенттій", "medical": "ні", "fluorography": "так", "gynecology": "ні", "vaccination": "ні"},
+                {"name": "Бачинська", "medical": "так", "fluorography": "ні", "gynecology": "так", "vaccination": "ні"}
+            ]
+            
+            НЕ ДОДАВАЙ ЖОДНОГО ТЕКСТУ КРІМ JSON!
             """
         else:
             prompt = """
-            Ти — експерт з розпізнавання таблиць графіків роботи.
+            Ти — експерт з розпізнавання текстів на фотографіях таблиць.
             
             На фото таблиця з графіком роботи працівників в неділю.
             
-            ТВОЄ ЗАВДАННЯ:
-            Розпізнати прізвища працівників, які позначені як ті, хто працює в неділю.
+            Знайди колонку з прізвищами та колонку з позначками хто працює.
+            Якщо є позначка (✓, +, Х, "так", "працює") - став "так", інакше "ні".
             
-            ВАЖЛИВІ ІНСТРУКЦІЇ:
-            1. Прізвища зазвичай в першій колонці
-            2. Позначки можуть бути: ✓, +, Х, "так"
-            3. Якщо є позначка - став "так", якщо пусто - "ні"
-            4. Ігноруй шапку таблиці
-            5. Відповідай ТІЛЬКИ у форматі JSON масивом
-            
-            ФОРМАТ ВІДПОВІДІ:
+            ВІДПОВІДАЙ ТІЛЬКИ У ФОРМАТІ JSON:
             [{"name": "Прізвище", "need_to_work": "так/ні"}]
+            
+            НЕ ДОДАВАЙ ЖОДНОГО ТЕКСТУ КРІМ JSON!
             """
         
-        # Викликаємо Gemini через REST API
+        # Викликаємо Gemini API
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
         
         payload = {
@@ -243,16 +270,18 @@ async def analyze_table_with_gemini(image_bytes, table_type="medical"):
             "generationConfig": {
                 "temperature": 0.1,
                 "topK": 1,
-                "topP": 0.8
+                "topP": 0.8,
+                "maxOutputTokens": 2048
             }
         }
         
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=60) as resp:
+            async with session.post(url, json=payload, timeout=90) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     if 'candidates' in data and len(data['candidates']) > 0:
                         result_text = data['candidates'][0]['content']['parts'][0]['text']
+                        logger.info(f"Gemini raw response: {result_text[:500]}")
                         
                         # Очищаємо відповідь
                         result_text = result_text.strip()
@@ -263,15 +292,27 @@ async def analyze_table_with_gemini(image_bytes, table_type="medical"):
                         if result_text.endswith('```'):
                             result_text = result_text[:-3]
                         
-                        result = json.loads(result_text.strip())
+                        # Шукаємо JSON масив
+                        json_match = re.search(r'\[.*\]', result_text, re.DOTALL)
+                        if json_match:
+                            result_text = json_match.group()
+                        
+                        result = json.loads(result_text)
+                        logger.info(f"Розпізнано {len(result)} працівників")
                         return result
                     else:
+                        logger.error(f"No candidates in response: {data}")
                         return None
                 else:
+                    error_text = await resp.text()
+                    logger.error(f"Gemini API error {resp.status}: {error_text}")
                     return None
                 
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error: {e}")
+        return None
     except Exception as e:
-        logger.error(f"Помилка аналізу: {e}")
+        logger.error(f"Analysis error: {e}")
         return None
 
 # --- ГОЛОВНЕ МЕНЮ ---
@@ -580,11 +621,12 @@ async def medical_start(message: types.Message, state: FSMContext):
     await message.answer(
         "🏥 **Медичний огляд працівників**\n\n"
         "📸 **Сфотографуйте таблицю** з графіком медоглядів.\n\n"
-        "Я розпізнаю прізвища та необхідні процедури:\n"
-        "• М - медогляд\n"
-        "• Ф - флюрографія\n"
-        "• Г - гінеколог\n"
-        "• В - щеплення\n\n"
+        "Таблиця повинна містити колонки:\n"
+        "• Прізвище, ім'я та по батькові\n"
+        "• Медогляд\n"
+        "• Флюорографія\n"
+        "• Гінеколог\n"
+        "• Вакцинація\n\n"
         "💡 *Фотографуйте чітко, при хорошому освітленні*",
         parse_mode="Markdown"
     )
@@ -592,7 +634,7 @@ async def medical_start(message: types.Message, state: FSMContext):
 
 @dp.message(BotStates.waiting_for_medical_photo, F.photo)
 async def process_medical_photo(message: types.Message, state: FSMContext, bot: Bot):
-    wait_msg = await message.answer("🔍 **Аналізую таблицю...**\n(це займе 3-5 секунд)", parse_mode="Markdown")
+    wait_msg = await message.answer("🔍 **Аналізую таблицю...**\n(це займе 5-10 секунд)", parse_mode="Markdown")
     
     try:
         photo = message.photo[-1]
@@ -604,7 +646,14 @@ async def process_medical_photo(message: types.Message, state: FSMContext, bot: 
         if not employees:
             await wait_msg.edit_text(
                 "❌ **Не вдалося розпізнати таблицю.**\n\n"
-                "💡 Спробуйте сфотографувати ще раз, тримаючи камеру паралельно таблиці.",
+                "📌 **Можливі причини:**\n"
+                "• Погане освітлення\n"
+                "• Розмите фото\n"
+                "• Нестандартний формат таблиці\n\n"
+                "💡 **Поради:**\n"
+                "• Сфотографуйте при денному світлі\n"
+                "• Тримайте камеру рівно\n"
+                "• Переконайтеся, що текст чіткий",
                 parse_mode="Markdown"
             )
             await state.clear()
@@ -731,7 +780,7 @@ async def sunday_start(message: types.Message, state: FSMContext):
 
 @dp.message(BotStates.waiting_for_sunday_photo, F.photo)
 async def process_sunday_photo(message: types.Message, state: FSMContext, bot: Bot):
-    wait_msg = await message.answer("🔍 **Аналізую таблицю...**\n(це займе 3-5 секунд)", parse_mode="Markdown")
+    wait_msg = await message.answer("🔍 **Аналізую таблицю...**\n(це займе 5-10 секунд)", parse_mode="Markdown")
     
     try:
         photo = message.photo[-1]
@@ -890,17 +939,10 @@ async def any_msg(m: types.Message):
 async def shutdown():
     logger.info("Отримано сигнал завершення...")
     shutdown_event.set()
-    
-    # Зупиняємо планувальник
     scheduler.shutdown(wait=False)
-    
-    # Зупиняємо веб-сервер
     if web_runner:
         await web_runner.cleanup()
-    
-    # Закриваємо сесію бота
     await bot.session.close()
-    
     logger.info("Бот зупинено")
     sys.exit(0)
 
@@ -913,7 +955,6 @@ async def main():
     
     init_db()
     
-    # Налаштовуємо обробку сигналів
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda s, f: asyncio.create_task(shutdown()))
     
@@ -923,7 +964,6 @@ async def main():
     scheduler.add_job(global_check, "interval", minutes=1)
     scheduler.start()
     
-    # Веб-сервер для health check
     app = web.Application()
     app.router.add_get("/", lambda r: web.Response(text="OK"))
     web_runner = web.AppRunner(app)
@@ -933,7 +973,6 @@ async def main():
     
     logger.info("🚀 Бот успішно запущено!")
     
-    # Запускаємо polling
     try:
         await dp.start_polling(bot)
     except asyncio.CancelledError:
