@@ -15,6 +15,9 @@ from aiogram.fsm.state import State, StatesGroup
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+# Імпортуємо SMS Fly клієнт
+from sms_fly_client import SMSFlyClient
+
 # --- Налаштування ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -24,7 +27,7 @@ KYIV_TZ = pytz.timezone("Europe/Kyiv")
 
 # Gemini та SMS Fly налаштування
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCacI5LRq7QbHKtdKRv9s-IAF3orgeYpbw")
-SMS_FLY_API_KEY = os.getenv("SMS_FLY_API_KEY")
+SMS_FLY_API_KEY = os.getenv("SMS_FLY_API_KEY", "t1G7njJlTFjmCJRs7HV96ZLG2gmND9O5")
 SMS_FLY_SENDER = os.getenv("SMS_FLY_SENDER", "YourBot")
 
 bot = Bot(token=TOKEN)
@@ -43,50 +46,11 @@ class BotStates(StatesGroup):
     waiting_for_employee_data = State()
     waiting_for_task_name = State()
     waiting_for_route_data = State()
-    # Нові стани для медпункту та роботи в неділю
     waiting_for_medical_photo = State()
     waiting_for_sunday_photo = State()
 
-# --- SMS Fly клієнт ---
-class SMSFlyClient:
-    def __init__(self, api_key, sender):
-        self.api_key = api_key
-        self.sender = sender
-        self.base_url = "https://api.smsfly.ua/api/v1"
-
-    async def send_sms(self, phone, message):
-        """Відправка SMS"""
-        if not self.api_key:
-            return {"success": False, "error": "API ключ не налаштовано"}
-        
-        # Нормалізуємо номер
-        phone = ''.join(filter(str.isdigit, phone))
-        if phone.startswith('0'):
-            phone = '+38' + phone
-        elif phone.startswith('380'):
-            phone = '+' + phone
-        elif phone.startswith('8'):
-            phone = '+38' + phone[1:]
-            
-        url = f"{self.base_url}/send"
-        payload = {
-            "api_key": self.api_key,
-            "to": phone,
-            "from": self.sender,
-            "text": message
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.post(url, json=payload, timeout=10) as resp:
-                    data = await resp.json()
-                    return {"success": resp.status == 200, "data": data}
-            except Exception as e:
-                logging.error(f"SMS send error: {e}")
-                return {"success": False, "error": str(e)}
-
 # Ініціалізуємо SMS клієнт
-sms_client = SMSFlyClient(SMS_FLY_API_KEY, SMS_FLY_SENDER) if SMS_FLY_API_KEY else None
+sms_client = SMSFlyClient(SMS_FLY_API_KEY, SMS_FLY_SENDER)
 
 # --- База даних ---
 def init_db():
@@ -110,10 +74,8 @@ def init_db():
         )
     """)
     
-    # Індекс для швидкого пошуку
     cur.execute("CREATE INDEX IF NOT EXISTS idx_employee_phones_name ON employee_phones(full_name);")
     
-    # Оновлення таблиці tasks для нагадувань
     try:
         cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS remind_at TIMESTAMP;")
     except Exception as e:
@@ -129,7 +91,6 @@ def get_employee_phone(full_name):
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
-        # Шукаємо за співпадінням прізвища
         short_name = full_name.split()[0] if ' ' in full_name else full_name
         cur.execute("SELECT phone FROM employee_phones WHERE full_name ILIKE %s LIMIT 1", (f"%{short_name}%",))
         result = cur.fetchone()
@@ -140,25 +101,6 @@ def get_employee_phone(full_name):
         logging.error(f"Get phone error: {e}")
         return None
 
-def save_employee_phone(full_name, phone):
-    """Зберегти номер телефону працівника"""
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO employee_phones (full_name, phone, updated_at) 
-            VALUES (%s, %s, CURRENT_TIMESTAMP)
-            ON CONFLICT (full_name) 
-            DO UPDATE SET phone = EXCLUDED.phone, updated_at = CURRENT_TIMESTAMP
-        """, (full_name, phone))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return True
-    except Exception as e:
-        logging.error(f"Save phone error: {e}")
-        return False
-
 # --- Функція для аналізу фото через Gemini ---
 async def analyze_photo_with_gemini(image_bytes, prompt):
     """Аналіз фото через Gemini API"""
@@ -166,7 +108,6 @@ async def analyze_photo_with_gemini(image_bytes, prompt):
         return None
     
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-    
     image_base64 = base64.b64encode(image_bytes).decode('utf-8')
     
     payload = {
@@ -200,7 +141,8 @@ def main_menu():
     builder.button(text="🎂 Дні народження")
     builder.button(text="🏥 Медпункт")
     builder.button(text="📅 Робота в неділю")
-    builder.adjust(2, 2, 2)
+    builder.button(text="💰 Баланс SMS")
+    builder.adjust(2, 2, 2, 1)
     return builder.as_markup(resize_keyboard=True)
 
 # --- 1. START ---
@@ -217,7 +159,7 @@ async def cmd_start(m: types.Message, state: FSMContext):
     conn.close()
     await m.answer("👋 Вітаю! Я оновився і готовий до роботи.", reply_markup=main_menu())
 
-# --- 2. ЗАВДАННЯ + НАГАДУВАННЯ ---
+# --- 2. ЗАВДАННЯ ---
 async def get_tasks_kb():
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
@@ -290,7 +232,6 @@ async def set_reminder(c: types.CallbackQuery):
     parts = c.data.split("_")
     tid = int(parts[1])
     minutes = int(parts[2])
-    
     remind_time = datetime.now(KYIV_TZ) + timedelta(minutes=minutes)
     
     conn = psycopg2.connect(DATABASE_URL)
@@ -468,7 +409,7 @@ async def e_del_do(c: types.CallbackQuery):
     await c.answer("Видалено!")
     await e_list(c)
 
-# --- 5. ЗМІНА ТА СИСТЕМНІ НАГАДУВАННЯ ---
+# --- 5. ЗМІНА ---
 @dp.message(F.text == "⚙️ Зміна")
 async def change_shift(m: types.Message, state: FSMContext):
     await state.clear()
@@ -487,10 +428,30 @@ async def set_shift(c: types.CallbackQuery):
     await c.message.answer(f"✅ Встановлено графік: {s.upper()}")
     await c.answer()
 
-# --- 6. НОВИЙ ФУНКЦІОНАЛ: МЕДПУНКТ ---
+# --- 6. БАЛАНС SMS ---
+@dp.message(F.text == "💰 Баланс SMS")
+async def check_sms_balance(message: types.Message):
+    """Перевірка балансу SMS Fly"""
+    wait_msg = await message.answer("🔄 Перевіряю баланс...")
+    
+    balance = await sms_client.get_extended_balance()
+    
+    if balance.get('success'):
+        await wait_msg.edit_text(
+            f"💰 **Баланс SMS Fly:**\n\n"
+            f"📱 SMS: {balance.get('sms_balance', '0')} грн\n"
+            f"💬 Viber: {balance.get('viber_balance', '0')} грн",
+            parse_mode="Markdown"
+        )
+    else:
+        await wait_msg.edit_text(
+            f"❌ **Помилка отримання балансу:**\n{balance.get('error_description', 'Невідома помилка')}",
+            parse_mode="Markdown"
+        )
+
+# --- 7. МЕДПУНКТ ---
 @dp.message(F.text == "🏥 Медпункт")
 async def medical_start(message: types.Message, state: FSMContext):
-    """Почати роботу з медпунктом"""
     await message.answer(
         "🏥 **Медичний огляд працівників**\n\n"
         "Сфотографуйте таблицю з графіком медоглядів.\n"
@@ -502,16 +463,13 @@ async def medical_start(message: types.Message, state: FSMContext):
 
 @dp.message(BotStates.waiting_for_medical_photo, F.photo)
 async def process_medical_photo(message: types.Message, state: FSMContext, bot: Bot):
-    """Обробити фото таблиці з медоглядами"""
     wait_msg = await message.answer("📊 **Аналізую таблицю...**", parse_mode="Markdown")
     
     try:
-        # Отримуємо фото
         photo = message.photo[-1]
         file = await bot.get_file(photo.file_id)
         file_bytes = await bot.download_file(file.file_path)
         
-        # Аналізуємо через Gemini
         prompt = """Проаналізуй цю таблицю з медичними оглядами. 
         Розпізнай прізвища працівників та позначки.
         
@@ -520,17 +478,15 @@ async def process_medical_photo(message: types.Message, state: FSMContext, bot: 
         Відповідай ТІЛЬКИ у форматі JSON (без жодного іншого тексту):
         [{"name": "Прізвище", "medical": "так/ні", "fluorography": "так/ні", "gynecology": "так/ні", "vaccination": "так/ні"}]
         
-        Приклад: [{"name": "Костюк", "medical": "так", "fluorography": "ні", "gynecology": "ні", "vaccination": "так"}]
-        """
+        Приклад: [{"name": "Костюк", "medical": "так", "fluorography": "ні", "gynecology": "ні", "vaccination": "так"}]"""
         
         result_text = await analyze_photo_with_gemini(file_bytes.read(), prompt)
         
         if not result_text:
-            await wait_msg.edit_text("❌ Не вдалося розпізнати таблицю. Спробуйте сфотографувати чіткіше.")
+            await wait_msg.edit_text("❌ Не вдалося розпізнати таблицю.")
             await state.clear()
             return
         
-        # Очищаємо відповідь від можливих маркерів
         result_text = result_text.strip()
         if result_text.startswith('```json'):
             result_text = result_text[7:]
@@ -539,16 +495,14 @@ async def process_medical_photo(message: types.Message, state: FSMContext, bot: 
         if result_text.endswith('```'):
             result_text = result_text[:-3]
         
-        # Парсимо JSON
         try:
             employees = json.loads(result_text.strip())
         except json.JSONDecodeError as e:
             logging.error(f"JSON parse error: {e}\nText: {result_text}")
-            await wait_msg.edit_text("❌ Помилка розпізнавання даних. Спробуйте ще раз.")
+            await wait_msg.edit_text("❌ Помилка розпізнавання даних.")
             await state.clear()
             return
         
-        # Формуємо результат
         result = "📋 **Результат аналізу:**\n\n"
         employees_with_needs = []
         
@@ -574,10 +528,8 @@ async def process_medical_photo(message: types.Message, state: FSMContext, bot: 
             await state.clear()
             return
         
-        # Зберігаємо в стан
         await state.update_data(medical_employees=employees_with_needs)
         
-        # Додаємо кнопки
         kb = InlineKeyboardBuilder()
         kb.button(text="✉️ Відправити SMS нагадування", callback_data="send_medical_sms")
         kb.button(text="❌ Скасувати", callback_data="cancel_medical")
@@ -591,12 +543,11 @@ async def process_medical_photo(message: types.Message, state: FSMContext, bot: 
         
     except Exception as e:
         logging.error(f"Medical error: {e}")
-        await wait_msg.edit_text("❌ Помилка обробки фото. Спробуйте ще раз.")
+        await wait_msg.edit_text("❌ Помилка обробки фото.")
         await state.clear()
 
 @dp.callback_query(F.data == "send_medical_sms")
 async def send_medical_sms(callback: types.CallbackQuery, state: FSMContext):
-    """Відправити SMS про медогляди"""
     data = await state.get_data()
     employees = data.get('medical_employees', [])
     
@@ -605,20 +556,13 @@ async def send_medical_sms(callback: types.CallbackQuery, state: FSMContext):
         await state.clear()
         return
     
-    if not sms_client:
-        await callback.message.edit_text("❌ SMS сервіс не налаштовано. Додайте SMS_FLY_API_KEY в .env")
-        await state.clear()
-        return
-    
     await callback.message.edit_text(f"📤 **Відправляю SMS {len(employees)} працівникам...**\nБудь ласка, зачекайте.", parse_mode="Markdown")
     
     results = []
     for emp in employees:
-        # Отримуємо телефон
         phone = get_employee_phone(emp['name'])
         
         if phone:
-            # Формуємо повідомлення
             needed = []
             if emp.get('medical') == 'так':
                 needed.append("медогляд")
@@ -639,25 +583,13 @@ async def send_medical_sms(callback: types.CallbackQuery, state: FSMContext):
         else:
             results.append({"name": emp['name'], "success": False, "error": "немає телефону"})
     
-    # Формуємо звіт
     success_count = sum(1 for r in results if r.get('success') is True)
-    no_phone_count = sum(1 for r in results if r.get('success') is False and r.get('error') == "немає телефону")
-    error_count = sum(1 for r in results if r.get('success') is False and r.get('error') != "немає телефону")
+    no_phone_count = sum(1 for r in results if r.get('error') == "немає телефону")
     
     report = f"📊 **Звіт про відправку SMS:**\n\n"
     report += f"✅ Успішно: {success_count}\n"
     report += f"📭 Немає телефону: {no_phone_count}\n"
-    report += f"❌ Помилок: {error_count}\n\n"
-    
-    if results:
-        report += "**Деталі:**\n"
-        for r in results[:15]:
-            if r.get('success') is True:
-                report += f"✅ {r['name']} ({r.get('phone', '')})\n"
-            elif r.get('error') == "немає телефону":
-                report += f"📭 {r['name']} - немає номера\n"
-            else:
-                report += f"❌ {r['name']} - помилка\n"
+    report += f"❌ Помилок: {len(employees) - success_count - no_phone_count}\n\n"
     
     await callback.message.edit_text(report, parse_mode="Markdown")
     await state.clear()
@@ -665,15 +597,13 @@ async def send_medical_sms(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "cancel_medical")
 async def cancel_medical(callback: types.CallbackQuery, state: FSMContext):
-    """Скасувати відправку"""
     await callback.message.edit_text("✅ Операцію скасовано. SMS не відправлено.")
     await state.clear()
     await callback.answer()
 
-# --- 7. НОВИЙ ФУНКЦІОНАЛ: РОБОТА В НЕДІЛЮ ---
+# --- 8. РОБОТА В НЕДІЛЮ ---
 @dp.message(F.text == "📅 Робота в неділю")
 async def sunday_start(message: types.Message, state: FSMContext):
-    """Почати роботу з графіком на неділю"""
     await message.answer(
         "📅 **Графік роботи в неділю**\n\n"
         "Сфотографуйте таблицю з графіком.\n"
@@ -685,7 +615,6 @@ async def sunday_start(message: types.Message, state: FSMContext):
 
 @dp.message(BotStates.waiting_for_sunday_photo, F.photo)
 async def process_sunday_photo(message: types.Message, state: FSMContext, bot: Bot):
-    """Обробити фото графіка на неділю"""
     wait_msg = await message.answer("📊 **Аналізую таблицю...**", parse_mode="Markdown")
     
     try:
@@ -697,19 +626,15 @@ async def process_sunday_photo(message: types.Message, state: FSMContext, bot: B
         Розпізнай прізвища працівників, які позначені як ті, хто працює в неділю.
         
         Відповідай ТІЛЬКИ у форматі JSON (без жодного іншого тексту):
-        [{"name": "Прізвище", "need_to_work": "так/ні"}]
-        
-        Приклад: [{"name": "Костюк", "need_to_work": "так"}, {"name": "Склярук", "need_to_work": "ні"}]
-        """
+        [{"name": "Прізвище", "need_to_work": "так/ні"}]"""
         
         result_text = await analyze_photo_with_gemini(file_bytes.read(), prompt)
         
         if not result_text:
-            await wait_msg.edit_text("❌ Не вдалося розпізнати таблицю. Спробуйте сфотографувати чіткіше.")
+            await wait_msg.edit_text("❌ Не вдалося розпізнати таблицю.")
             await state.clear()
             return
         
-        # Очищаємо відповідь
         result_text = result_text.strip()
         if result_text.startswith('```json'):
             result_text = result_text[7:]
@@ -718,16 +643,13 @@ async def process_sunday_photo(message: types.Message, state: FSMContext, bot: B
         if result_text.endswith('```'):
             result_text = result_text[:-3]
         
-        # Парсимо JSON
         try:
             employees = json.loads(result_text.strip())
-        except json.JSONDecodeError as e:
-            logging.error(f"JSON parse error: {e}\nText: {result_text}")
-            await wait_msg.edit_text("❌ Помилка розпізнавання даних. Спробуйте ще раз.")
+        except json.JSONDecodeError:
+            await wait_msg.edit_text("❌ Помилка розпізнавання даних.")
             await state.clear()
             return
         
-        # Фільтруємо тих, хто працює
         workers = [emp for emp in employees if emp.get('need_to_work') == 'так']
         
         if not workers:
@@ -754,22 +676,16 @@ async def process_sunday_photo(message: types.Message, state: FSMContext, bot: B
         
     except Exception as e:
         logging.error(f"Sunday error: {e}")
-        await wait_msg.edit_text("❌ Помилка обробки фото. Спробуйте ще раз.")
+        await wait_msg.edit_text("❌ Помилка обробки фото.")
         await state.clear()
 
 @dp.callback_query(F.data == "send_sunday_sms")
 async def send_sunday_sms(callback: types.CallbackQuery, state: FSMContext):
-    """Відправити SMS про роботу в неділю"""
     data = await state.get_data()
     workers = data.get('sunday_workers', [])
     
     if not workers:
         await callback.answer("Немає даних для відправки")
-        await state.clear()
-        return
-    
-    if not sms_client:
-        await callback.message.edit_text("❌ SMS сервіс не налаштовано. Додайте SMS_FLY_API_KEY в .env")
         await state.clear()
         return
     
@@ -786,7 +702,6 @@ async def send_sunday_sms(callback: types.CallbackQuery, state: FSMContext):
         else:
             results.append({"name": worker['name'], "success": False, "error": "немає телефону"})
     
-    # Формуємо звіт
     success_count = sum(1 for r in results if r.get('success') is True)
     no_phone_count = sum(1 for r in results if r.get('error') == "немає телефону")
     
@@ -795,28 +710,17 @@ async def send_sunday_sms(callback: types.CallbackQuery, state: FSMContext):
     report += f"📭 Немає телефону: {no_phone_count}\n"
     report += f"❌ Помилок: {len(workers) - success_count - no_phone_count}\n\n"
     
-    if results:
-        report += "**Деталі:**\n"
-        for r in results[:15]:
-            if r.get('success') is True:
-                report += f"✅ {r['name']} ({r.get('phone', '')})\n"
-            elif r.get('error') == "немає телефону":
-                report += f"📭 {r['name']} - немає номера\n"
-            else:
-                report += f"❌ {r['name']} - помилка\n"
-    
     await callback.message.edit_text(report, parse_mode="Markdown")
     await state.clear()
     await callback.answer()
 
 @dp.callback_query(F.data == "cancel_sunday")
 async def cancel_sunday(callback: types.CallbackQuery, state: FSMContext):
-    """Скасувати відправку"""
     await callback.message.edit_text("✅ Операцію скасовано. SMS не відправлено.")
     await state.clear()
     await callback.answer()
 
-# --- 8. ГОЛОВНА ФУНКЦІЯ ПЕРЕВІРКИ (ЩОХВИЛИНИ) ---
+# --- 9. ГОЛОВНА ФУНКЦІЯ ПЕРЕВІРКИ ---
 async def global_check():
     now = datetime.now(KYIV_TZ)
     t = now.strftime("%H:%M")
@@ -826,7 +730,6 @@ async def global_check():
     cur.execute("SELECT user_id, shift_type FROM users")
     users = cur.fetchall()
     
-    # 1. ПЕРЕВІРКА ДНІВ НАРОДЖЕННЯ (Щодня о 09:00)
     if t == "09:00":
         cur.execute("SELECT full_name FROM employees WHERE EXTRACT(MONTH FROM birth_date) = %s AND EXTRACT(DAY FROM birth_date) = %s", (now.month, now.day))
         bdays = cur.fetchall()
@@ -839,7 +742,6 @@ async def global_check():
                 except:
                     pass
 
-    # 2. ФІКСОВАНІ НАГАДУВАННЯ
     for uid, s in users:
         msg = None
         if s == 'night' and t == "02:45":
@@ -859,7 +761,6 @@ async def global_check():
             except:
                 pass
 
-    # 3. НАГАДУВАННЯ ПРО ЗАВДАННЯ
     cur.execute("SELECT id, title FROM tasks WHERE is_done = FALSE AND remind_at IS NOT NULL AND remind_at <= %s", (now,))
     due_tasks = cur.fetchall()
     
@@ -880,7 +781,7 @@ async def global_check():
     cur.close()
     conn.close()
 
-# --- 9. ЗАГАЛЬНИЙ ОБРОБНИК ---
+# --- 10. ЗАГАЛЬНИЙ ОБРОБНИК ---
 @dp.message()
 async def any_msg(m: types.Message):
     await m.answer("Будь ласка, використовуйте меню 👇", reply_markup=main_menu())
@@ -900,7 +801,7 @@ async def main():
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', 10000).start()
     
-    logging.info("ASTRO BOT STARTED WITH REMINDERS + MEDICAL + SUNDAY WORK")
+    logging.info("ASTRO BOT STARTED WITH REMINDERS + MEDICAL + SUNDAY WORK + SMS FLY")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
