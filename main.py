@@ -24,20 +24,25 @@ from io import BytesIO
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# 🔐 ВСІ КЛЮЧІ БЕРУТЬСЯ З ЗМІННИХ СЕРЕДОВИЩА 🔐
 TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-KYIV_TZ = pytz.timezone("Europe/Kyiv")
-
-# API ключі
-GEMINI_API_KEY = "AIzaSyDF02DF1mWlzY9LbykDp5SL9fsJhNd9Hxo"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SMS_FLY_API_KEY = os.getenv("SMS_FLY_API_KEY", "t1G7njJlTFjmCJRs7HV96ZLG2gmND9O5")
 SMS_FLY_SENDER = os.getenv("SMS_FLY_SENDER", "YourBot")
+KYIV_TZ = pytz.timezone("Europe/Kyiv")
+
+# Перевірка наявності ключів
+if not GEMINI_API_KEY:
+    logger.error("❌ GEMINI_API_KEY не знайдено в змінних середовища!")
+if not TOKEN:
+    logger.error("❌ BOT_TOKEN не знайдено в змінних середовища!")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone=KYIV_TZ)
 
-# Глобальні змінні для graceful shutdown
+# Глобальні змінні
 shutdown_event = asyncio.Event()
 web_runner = None
 
@@ -198,6 +203,10 @@ async def compress_image(image_bytes, max_size=800, quality=60):
 
 # --- ФУНКЦІЯ АНАЛІЗУ ТАБЛИЦЬ ЧЕРЕЗ GEMINI 2.5 FLASH ---
 async def analyze_table_with_gemini(image_bytes, table_type="medical"):
+    if not GEMINI_API_KEY:
+        logger.error("GEMINI_API_KEY не налаштовано!")
+        return None
+    
     compressed_image = await compress_image(image_bytes, max_size=800, quality=60)
     image_base64 = base64.b64encode(compressed_image).decode('utf-8')
     
@@ -205,13 +214,10 @@ async def analyze_table_with_gemini(image_bytes, table_type="medical"):
         prompt = """Ти експерт з розпізнавання таблиць. На фото таблиця медоглядів.
 Колонки: Прізвище, Медогляд, Флюорографія, Гінеколог, Вакцинація.
 Позначки "потрібно" = "так", "ні" = "ні".
-Відповідай ТІЛЬКИ JSON без пояснень. Ось приклад правильної відповіді:
-[{"name": "Акенттій", "medical": "ні", "fluorography": "так", "gynecology": "ні", "vaccination": "ні"}]
-"""
+Відповідай ТІЛЬКИ JSON. Приклад: [{"name": "Акенттій", "medical": "ні", "fluorography": "так", "gynecology": "ні", "vaccination": "ні"}]"""
     else:
         prompt = """Ти експерт з розпізнавання таблиць. На фото таблиця роботи в неділю.
-Відповідай ТІЛЬКИ JSON: [{"name": "Прізвище", "need_to_work": "так/ні"}]
-Приклад: [{"name": "Костюк", "need_to_work": "так"}]"""
+Відповідай ТІЛЬКИ JSON: [{"name": "Прізвище", "need_to_work": "так/ні"}]"""
     
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     
@@ -224,7 +230,7 @@ async def analyze_table_with_gemini(image_bytes, table_type="medical"):
         }],
         "generationConfig": {
             "temperature": 0.1,
-            "maxOutputTokens": 4096  # ЗБІЛЬШЕНО для повної відповіді
+            "maxOutputTokens": 4096
         }
     }
     
@@ -235,9 +241,8 @@ async def analyze_table_with_gemini(image_bytes, table_type="medical"):
                     data = await resp.json()
                     if 'candidates' in data and len(data['candidates']) > 0:
                         result_text = data['candidates'][0]['content']['parts'][0]['text']
-                        logger.info(f"Gemini відповів: {result_text[:500]}")
+                        logger.info(f"Gemini відповів: {result_text[:300]}")
                         
-                        # Очищаємо відповідь від маркерів
                         result_text = result_text.strip()
                         if result_text.startswith('```json'):
                             result_text = result_text[7:]
@@ -246,37 +251,29 @@ async def analyze_table_with_gemini(image_bytes, table_type="medical"):
                         if result_text.endswith('```'):
                             result_text = result_text[:-3]
                         
-                        # Шукаємо JSON масив
                         json_match = re.search(r'\[\s*\{.*\}\s*\]', result_text, re.DOTALL)
                         if json_match:
                             result_text = json_match.group()
                         
-                        # Додаткова перевірка на неповний JSON
                         try:
                             result = json.loads(result_text)
                             logger.info(f"Розпізнано {len(result)} працівників")
                             return result
-                        except json.JSONDecodeError as e:
-                            logger.error(f"JSON помилка: {e}")
-                            # Спроба виправити неповний JSON
+                        except json.JSONDecodeError:
                             if result_text.endswith(','):
                                 result_text = result_text[:-1] + "}]"
                             elif not result_text.endswith(']'):
                                 result_text = result_text + "}]"
-                            try:
-                                result = json.loads(result_text)
-                                return result
-                            except:
-                                return None
+                            result = json.loads(result_text)
+                            return result
                     else:
-                        logger.error(f"No candidates in response: {data}")
                         return None
                 elif resp.status == 403:
-                    logger.error("API ключ заблоковано! Отримайте новий ключ")
+                    logger.error("❌ API ключ заблоковано! Отримайте новий ключ в Google AI Studio")
                     return None
                 else:
                     error_text = await resp.text()
-                    logger.error(f"Gemini API error {resp.status}: {error_text}")
+                    logger.error(f"Gemini API error {resp.status}: {error_text[:200]}")
                     return None
     except Exception as e:
         logger.error(f"Analysis error: {e}")
@@ -908,12 +905,17 @@ def signal_handler():
 async def main():
     global web_runner
     
+    if not GEMINI_API_KEY:
+        logger.error("❌ GEMINI_API_KEY не знайдено! Бот не зможе аналізувати фото.")
+    if not TOKEN:
+        logger.error("❌ BOT_TOKEN не знайдено! Бот не запуститься.")
+        return
+    
     init_db()
     
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda s, f: asyncio.create_task(shutdown()))
     
-    # ВАЖЛИВО: Зупиняємо webhook перед запуском polling
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(2)
     
@@ -927,7 +929,7 @@ async def main():
     site = web.TCPSite(web_runner, '0.0.0.0', 10000)
     await site.start()
     
-    logger.info("🚀 Бот успішно запущено з Gemini 2.5 Flash!")
+    logger.info("🚀 Бот успішно запущено!")
     
     try:
         await dp.start_polling(bot)
